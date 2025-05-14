@@ -20,44 +20,115 @@ import class Basics.ObservabilityScope
 import struct Basics.RelativePath
 import struct PackageGraph.PackageGraphRootInput
 import struct SourceControl.Revision
+import PackageGraph
 
 extension Workspace {
     /// Edit implementation.
     func _edit(
         packageIdentity: String,
+        root: PackageGraphRootInput,
         path: AbsolutePath? = nil,
         revision: Revision? = nil,
         checkoutBranch: String? = nil,
         observabilityScope: ObservabilityScope
     ) async throws {
-        // Look up the dependency and check if we can edit it.
-        guard let dependency = await self.state.dependencies[.plain(packageIdentity)] else {
+        // Look up the dependency and check if we can edit it - this checks whether the
+        // dependency is a managed dependency and has already been resolved.
+//        guard let dependency = await self.state.dependencies[.plain(packageIdentity)] else {
+//            observabilityScope.emit(.dependencyNotFound(packageName: packageIdentity))
+//            return
+//        }
+
+        var dependencyPackageRef: PackageReference
+        let dependencyIdentity: PackageIdentity
+        var checkoutState: CheckoutState? = nil
+        var oldCheckoutPath: AbsolutePath? = nil
+        var managedDependency: ManagedDependency? = nil
+        if let dependency = await self.state.dependencies[.plain(packageIdentity)] {
+            managedDependency = dependency
+            dependencyPackageRef = dependency.packageRef
+            dependencyIdentity = dependency.packageRef.identity
+
+            switch dependency.state {
+            case .sourceControlCheckout(let _checkoutState):
+                checkoutState = _checkoutState
+            case .edited:
+                observabilityScope.emit(error: "dependency '\(dependency.packageRef.identity)' already in edit mode")
+                return
+            case .fileSystem:
+                observabilityScope.emit(error: "local dependency '\(dependency.packageRef.identity)' can't be edited")
+                return
+            case .registryDownload:
+                observabilityScope.emit(error: "registry dependency '\(dependency.packageRef.identity)' can't be edited")
+                return
+            case .custom:
+                observabilityScope.emit(error: "custom dependency '\(dependency.packageRef.identity)' can't be edited")
+                return
+            }
+
+            // Remove the existing checkout.
+//            do {
+                oldCheckoutPath = self.location.repositoriesCheckoutSubdirectory(for: dependency)
+//                try fileSystem.chmod(.userWritable, path: oldCheckoutPath, options: [.recursive, .onlyFiles])
+//                try fileSystem.removeFileTree(oldCheckoutPath)
+//            }
+
+
+        } else if let rootManifests = try? await self.loadRootManifests(
+            packages: root.packages,
+            observabilityScope: observabilityScope
+        ), let graphRoot = try? PackageGraphRoot(
+            input: root,
+            manifests: rootManifests,
+            dependencyMapper: self.dependencyMapper,
+            observabilityScope: observabilityScope
+        ), let dep = graphRoot.manifests.values.flatMap(\.dependencies).first(where: { $0.identity.description == packageIdentity })
+        {
+                dependencyPackageRef = dep.packageRef
+                dependencyIdentity = dep.identity
+
+                switch dep.packageRef.kind {
+                case .remoteSourceControl(let url):
+                    // do something
+                    observabilityScope.emit(warning: "found dependency via parse, remote src control, no managed deps yet: \(url)")
+                case .localSourceControl(let path):
+                    observabilityScope.emit(warning: "found dependency via parse, remote src control, no managed deps yet: \(path)")
+
+                default: // TODO: diagnostic for each other option
+                    observabilityScope.emit(error: "dependency '\(dep.identity)' can't be edited")
+                    return
+                }
+        } else {
             observabilityScope.emit(.dependencyNotFound(packageName: packageIdentity))
             return
         }
+//        throw WorkspaceDiagnostics.RevisionDoesNotExist(revision: "wasdf")
 
         let observabilityScope = observabilityScope.makeChildScope(
             description: "editing package",
-            metadata: dependency.packageRef.diagnosticsMetadata
+            metadata: dependencyPackageRef.diagnosticsMetadata
         )
 
-        let checkoutState: CheckoutState
-        switch dependency.state {
-        case .sourceControlCheckout(let _checkoutState):
-            checkoutState = _checkoutState
-        case .edited:
-            observabilityScope.emit(error: "dependency '\(dependency.packageRef.identity)' already in edit mode")
-            return
-        case .fileSystem:
-            observabilityScope.emit(error: "local dependency '\(dependency.packageRef.identity)' can't be edited")
-            return
-        case .registryDownload:
-            observabilityScope.emit(error: "registry dependency '\(dependency.packageRef.identity)' can't be edited")
-            return
-        case .custom:
-            observabilityScope.emit(error: "custom dependency '\(dependency.packageRef.identity)' can't be edited")
-            return
-        }
+//        observabilityScope.emit(warning: "executing edit for   \(packageIdentity)")
+
+//        let checkoutState: CheckoutState
+//        switch dependency.state {
+//        case .sourceControlCheckout(let _checkoutState):
+//            checkoutState = _checkoutState
+//        case .edited:
+//            observabilityScope.emit(error: "dependency '\(dependency.packageRef.identity)' already in edit mode")
+//            return
+//        case .fileSystem:
+//            observabilityScope.emit(error: "local dependency '\(dependency.packageRef.identity)' can't be edited")
+//            return
+//        case .registryDownload:
+//            observabilityScope.emit(error: "registry dependency '\(dependency.packageRef.identity)' can't be edited")
+//            return
+//        case .custom:
+//            observabilityScope.emit(error: "custom dependency '\(dependency.packageRef.identity)' can't be edited")
+//            return
+//        }
+        // Above: can check in parsed manifest re: packagedependency.packageRef
 
         // If a path is provided then we use it as destination. If not, we
         // use the folder with packageName inside editablesPath.
@@ -69,10 +140,10 @@ extension Workspace {
             // FIXME: this should not block
             let manifest = try await withCheckedThrowingContinuation { continuation in
                 self.loadManifest(
-                    packageIdentity: dependency.packageRef.identity,
+                    packageIdentity: dependencyIdentity,
                     packageKind: .fileSystem(destination),
                     packagePath: destination,
-                    packageLocation: dependency.packageRef.locationString,
+                    packageLocation: dependencyPackageRef.locationString,
                     observabilityScope: observabilityScope,
                     completion: {
                       continuation.resume(with: $0)
@@ -80,10 +151,10 @@ extension Workspace {
                 )
             }
 
-            guard dependency.packageRef.canonicalLocation == manifest.canonicalPackageLocation else {
+            guard dependencyPackageRef.canonicalLocation == manifest.canonicalPackageLocation else {
                 return observabilityScope
                     .emit(
-                        error: "package at '\(destination)' is \(dependency.packageRef.identity) but was expecting \(packageIdentity)"
+                        error: "package at '\(destination)' is \(dependencyIdentity) but was expecting \(packageIdentity)"
                     )
             }
 
@@ -105,9 +176,9 @@ extension Workspace {
             //
             // Get handle to the repository.
             // TODO: replace with async/await when available
-            let repository = try dependency.packageRef.makeRepositorySpecifier()
+            let repository = try dependencyPackageRef.makeRepositorySpecifier()
             let handle = try await repositoryManager.lookup(
-                package: dependency.packageRef.identity,
+                package: dependencyIdentity,
                 repository: repository,
                 updateStrategy: .never,
                 observabilityScope: observabilityScope,
@@ -125,6 +196,9 @@ extension Workspace {
             }
 
             let workingCopy = try handle.createWorkingCopy(at: destination, editable: true)
+            guard let checkoutState = checkoutState else {
+                throw WorkspaceDiagnostics.RevisionDoesNotExist(revision: "none")
+            }
             try workingCopy.checkout(revision: revision ?? checkoutState.revision)
 
             // Checkout to the new branch if provided.
@@ -152,17 +226,21 @@ extension Workspace {
             }
         }
 
-        // Remove the existing checkout.
-        do {
-            let oldCheckoutPath = self.location.repositoriesCheckoutSubdirectory(for: dependency)
-            try fileSystem.chmod(.userWritable, path: oldCheckoutPath, options: [.recursive, .onlyFiles])
-            try fileSystem.removeFileTree(oldCheckoutPath)
+//        // Remove the existing checkout.
+        if let oldCheckoutPath {
+            do {
+                //            let oldCheckoutPath = self.location.repositoriesCheckoutSubdirectory(for: dependency)
+                try fileSystem.chmod(.userWritable, path: oldCheckoutPath, options: [.recursive, .onlyFiles])
+                try fileSystem.removeFileTree(oldCheckoutPath)
+            }
         }
 
         // Save the new state.
-        try await self.state.add(
-            dependency: dependency.edited(subpath: RelativePath(validating: packageIdentity), unmanagedPath: path)
-        )
+        if let managedDependency {
+            try await self.state.add(
+                dependency: managedDependency.edited(subpath: RelativePath(validating: packageIdentity), unmanagedPath: path)
+            )
+        }
         try await self.state.save()
     }
 

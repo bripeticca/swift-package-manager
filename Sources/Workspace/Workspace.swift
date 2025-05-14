@@ -637,6 +637,7 @@ extension Workspace {
     ///     - observabilityScope: The observability scope that reports errors, warnings, etc
     public func edit(
         packageIdentity: String,
+        root: PackageGraphRootInput,
         path: AbsolutePath? = nil,
         revision: Revision? = nil,
         checkoutBranch: String? = nil,
@@ -645,6 +646,7 @@ extension Workspace {
         do {
             try await self._edit(
                 packageIdentity: packageIdentity,
+                root: root,
                 path: path,
                 revision: revision,
                 checkoutBranch: checkoutBranch,

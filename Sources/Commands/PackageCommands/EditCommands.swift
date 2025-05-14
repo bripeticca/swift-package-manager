@@ -38,10 +38,12 @@ extension SwiftPackageCommand {
 
         func run(_ swiftCommandState: SwiftCommandState) async throws {
             let workspace = try swiftCommandState.getActiveWorkspace()
+            let root = try swiftCommandState.getWorkspaceRoot()
 
             // Put the dependency in edit mode.
             await workspace.edit(
                 packageIdentity: packageIdentity,
+                root: root,
                 path: path,
                 revision: revision,
                 checkoutBranch: checkoutBranch,

@@ -454,8 +454,13 @@ public final class MockWorkspace {
         let observability = ObservabilitySystem.makeForTesting()
         await observability.topScope.trap {
             let ws = try self.getOrCreateWorkspace()
+            let rootInput = try PackageGraphRootInput(
+                packages: rootPaths(for: roots.map(\.name)), traitConfiguration: traitConfiguration
+            )
+
             await ws.edit(
                 packageIdentity: packageIdentity,
+                root: rootInput,
                 path: path,
                 revision: revision,
                 checkoutBranch: checkoutBranch,
