@@ -419,9 +419,19 @@ private func createResolvedPackages(
         observabilityScope: observabilityScope
     )
 
+    var moduleAliasTracker2 = try ModuleAliasTracker2(
+        packages: packageBuilders.map(\.package),
+        observabilityScope
+    )
+
+    // TODO bp module alias tracker stuff here;
+    // already walking the graph
     // Scan and validate the dependencies
     for packageBuilder in packageBuilders {
         let package = packageBuilder.package
+
+        // module alias add
+//        try moduleAliasTracker2.addAliases(package)
 
         let packageObservabilityScope = observabilityScope.makeChildScope(
             description: "Validating package dependencies",
@@ -1374,6 +1384,7 @@ private func resolveModuleAliases(
     packageBuilders: [ResolvedPackageBuilder],
     observabilityScope: ObservabilityScope
 ) throws -> Bool {
+    // ??? walking the graph anyway
     // If there are no module aliases specified, return early
     let hasAliases = packageBuilders.contains { $0.package.modules.contains {
         $0.dependencies.contains { dep in

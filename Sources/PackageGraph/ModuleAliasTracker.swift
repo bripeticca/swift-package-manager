@@ -449,13 +449,536 @@ extension Module {
     }
 
     var recursiveDependentModules: [Module] {
+        print("[ModuleAlias] BFS invoked on: \(self.name)")
         var list = [Module]()
         var nextDeps = self.dependencies
         while !nextDeps.isEmpty {
             let nextModules = nextDeps.compactMap{$0.module}
+            nextModules.forEach { print("[ModuleAlias] visiting: \($0.name)") }
             list.append(contentsOf: nextModules)
             nextDeps = nextModules.map{$0.dependencies}.flatMap{$0}
         }
         return list
+    }
+}
+
+struct ModuleAliasTracker2 {
+    /// Tracks packages consuming modules with aliased names
+//    fileprivate var packageToModuleAliases: [PackageIdentity: IdentifiableSet<ModuleAlias>] = [:]
+
+    /// Tracks all the module aliases
+    fileprivate var moduleAliases: IdentifiableSet<ModuleAlias> = []
+    fileprivate var consumingPackageAliases: [PackageIdentity: Set<ModuleAlias.ModuleAliasID>] = [:]
+
+    /// Key: fully qualified name of a product (package id + product name)
+    /// Value: list of modules that the product depends on
+    fileprivate var productModules: IdentifiableSet<ProductModules> = []
+
+    public struct ProductModules: Identifiable {
+        struct ModuleInfo: Identifiable, Hashable {
+            let module: Module
+            let directModuleDependencies: Set<String>
+
+            public var id: String {
+                return module.name
+            }
+
+            public init(module: Module) {
+                self.module = module
+                self.directModuleDependencies = Set(module.dependencies.compactMap(\.module).map(\.name))
+            }
+        }
+
+        let product: String
+        /// The directly dependent modules needed for the product.
+        let directModules: Set<String>
+        /// All transitively dependent modules across the package.
+        let allTransitiveModules: IdentifiableSet<ModuleInfo>
+        /// All transitively dependent cross-package products.
+        var childProducts: Set<String> = []
+
+        public var id: String {
+            self.product
+        }
+
+        public init(product: String, _ modules: [Module]) {
+            self.product = product
+            self.directModules = Set(modules.map(\.name))
+
+            var queue = modules
+            var visited: Set<String> = []
+            var allModules: IdentifiableSet<ModuleInfo> = []
+            var childProducts: Set<String> = []
+
+            // Continue to transitively populate modules
+            while !queue.isEmpty {
+                let currentModule = queue.removeFirst()
+                guard visited.insert(currentModule.name).inserted else { continue }
+                let currentModuleInfo = ModuleInfo(module: currentModule)
+                allModules.insert(currentModuleInfo)
+
+                // Follow chain of intra-dependent modules.
+                queue.append(contentsOf: currentModule.dependencies.compactMap(\.module))
+
+                // Collect cross-package product dependencies.
+                for dep in currentModule.dependencies {
+                    if case let .product(productRef, _) = dep {
+                        childProducts.insert(productRef.identity)
+                    }
+                }
+            }
+
+            self.childProducts = childProducts
+            self.allTransitiveModules = allModules
+        }
+    }
+
+    public init(packages: [Package], _ observabilityScope: ObservabilityScope) throws {
+        // Begin by building the full product -> module map.
+        packages.forEach({ package in
+            // Begin by pre-populating the product -> module map.
+            self.addProductModules(package)
+        })
+
+        try self.addAliases2(packages)
+
+        // Second pass to register all alias declarations.
+//        try packages.forEach({ package in
+//            // Create entry in module alias map for this package.
+//            if self.packageToModuleAliases[package.identity] == nil {
+//                self.packageToModuleAliases[package.identity] = []
+//            }
+//            try self.addAliases(package)
+//        })
+
+        // Propagate aliases across the package graph, applying terminal aliases
+        self.applyAliases(observabilityScope)
+    }
+
+    // First pass; add all the modules that make up each product.
+    public mutating func addProductModules(_ package: Package) {
+        for product in package.products {
+            // Don't redundantly populate the modules map
+            // todo; if we hit this, maybe bug?
+            guard productModules[product.identity] == nil else { continue }
+            let modules = product.modules
+            productModules[product.identity] = .init(product: product.identity, modules)
+        }
+    }
+
+    public mutating func addAliases2(_ packages: [Package]) throws {
+        // To track aliases that have not yet been resolved; this applies to aliases that
+        // do not have an identifiable "chain" yet, i.e. we have no matching ModuleAlias object.
+        var unresolvedAliases: IdentifiableSet<ModuleAlias.Alias> = []
+
+        for pkg in packages {
+            // First pass; detect all direct aliases. Delegate unresolveable aliases for second pass.
+            let consumingPackage = pkg.identity
+            for dep in pkg.modules.flatMap(\.dependencies) {
+                if case let .product(productRef, _) = dep,
+                   let productPkg = productRef.package,
+                   let aliases = productRef.moduleAliases,
+                   let modulesForProduct = self.productModules[productRef.identity]
+                {
+                    try aliases.forEach({ alias in
+                        let aliasInfo = ModuleAlias.Alias(
+                            name: alias.value,
+                            overridenName: alias.key,
+                            product: productRef,
+                            declaringPackage: consumingPackage,
+                            originatingPackage: .plain(productPkg)
+                        )
+
+                        // For aliases that are direct i.e. override the canonical name of a module
+                        if let moduleInfo = modulesForProduct.allTransitiveModules[alias.key] {
+                            let moduleAliasId = ModuleAlias.ModuleAliasID(
+                                moduleName: moduleInfo.module.name,
+                                packageIdentity: .plain(productPkg)
+                            )
+                            // Existing alias; add to alias chain.
+                            if let existingAlias = self.moduleAliases[moduleAliasId] {
+                                try existingAlias.addAlias(
+                                    aliasInfo.name,
+                                    oldName: aliasInfo.overridenName,
+                                    consumingPackage,
+                                    productRef,
+                                    .plain(productPkg)
+                                )
+                                self.consumingPackageAliases[consumingPackage, default: []].insert(existingAlias.id)
+                            } else {
+                                // New alias; add to the dict.
+                                let newAlias = ModuleAlias(
+                                    module: moduleInfo.module,
+                                    package: moduleAliasId.packageIdentity,
+                                )
+                                try newAlias.addAlias(
+                                    aliasInfo.name,
+                                    oldName: aliasInfo.overridenName,
+                                    aliasInfo.declaringPackage,
+                                    productRef,
+                                    .plain(productPkg)
+                                )
+                                // Update consuming package map + moduleAliases
+                                self.consumingPackageAliases[consumingPackage, default: []].insert(newAlias.id)
+                                self.moduleAliases.insert(newAlias)
+                            }
+                        } else if let matchingAliasId = self.consumingPackageAliases[consumingPackage]?.first(where: {
+                            guard let matchingAlias = self.moduleAliases[$0] else {
+                                return false
+                            }
+                            return matchingAlias.canChainAlias(alias: aliasInfo)
+                        }) {
+                            // todo bp cleanup above
+                            try self.moduleAliases[matchingAliasId]?.addAlias(
+                                aliasInfo.name,
+                                oldName: aliasInfo.overridenName,
+                                consumingPackage,
+                                productRef,
+                                .plain(productPkg)
+                            )
+                        } else {
+                            // For aliases that are possibly chained; add to unresolved.
+                            // We will resolve these on a second pass.
+
+                            // There could be intra-package aliases/chains here. TODO
+                            let (inserted, existing) = unresolvedAliases.insert(aliasInfo)
+                            if !inserted && existing.name != aliasInfo.name {
+                                throw PackageGraphError.multipleModuleAliases(
+                                    module: aliasInfo.overridenName,
+                                    product: aliasInfo.product.name,
+                                    package: productPkg,
+                                    aliases: [existing.name, aliasInfo.name]
+                                )
+                            }
+                        }
+                    })
+                }
+            }
+        }
+
+        // Set of IDs that represent which alias ids are overridden by another alias.
+        let reverseLookupUnresolvedAliases = Set(unresolvedAliases.map(\.reverseId))
+        // Set of aliases that represent the last node in the alias chain.
+        let unresolvedTerminalAliases = unresolvedAliases.filter({ !reverseLookupUnresolvedAliases.contains($0.id) })
+
+        for terminalAlias in unresolvedTerminalAliases {
+            var chain: [ModuleAlias.Alias] = []
+            var current: ModuleAlias.Alias? = terminalAlias
+            while let alias = current {
+                chain.append(alias)
+                current = unresolvedAliases[alias.reverseId]
+            }
+
+            // The root represents the alias closest to the declaration of the canonical module name
+            // wrt the alias chain (if any). Take the root and check against any existing module aliases
+            // that we can chain this to.
+            guard let root = chain.last else { continue }
+            // Check whether we can identify an existing module alias for the given package.
+            let originatingPackage = root.originatingPackage
+
+            var resolved = false
+            if let moduleAliasIds = self.consumingPackageAliases[originatingPackage] {
+                for id in moduleAliasIds {
+                    guard let moduleAlias = self.moduleAliases[id] else { continue }
+                    if moduleAlias.canChainAlias(alias: root) {
+                        for alias in chain.reversed() {
+                            try moduleAlias.addAlias(alias)
+                            self.consumingPackageAliases[alias.declaringPackage, default: []].insert(moduleAlias.id)
+                        }
+                        resolved = true
+                        break
+                    }
+                }
+            }
+
+            if !resolved {
+                // Emit diagnostics for each alias in this chain
+                // todo
+                for alias in chain {
+//                    observabilityScope.emit(warning: "module alias '\(alias.overridenName)' -> '\(alias.name)' declared in package '\(alias.consumingPackage)' could not be resolved")
+                }
+            }
+        }
+    }
+
+    // Thid pass; propagate aliases
+    private mutating func applyAliases(_ observabilityScope: ObservabilityScope) {
+        // Validate module aliases that still need to be addressed as direct ref.
+        let moduleNameToAlias = Dictionary(grouping: moduleAliases, by: { $0.module.name })
+
+        for moduleAlias in self.moduleAliases {
+            // Dependency cycle detection
+            var visitedProducts: Set<String> = []
+            func applyToProduct(_ product: String, applying operation: (Module) -> Void) {
+                guard visitedProducts.insert(product).inserted else { return }
+                guard let product = self.productModules[product] else { return }
+                for moduleInfo in product.allTransitiveModules {
+                    operation(moduleInfo.module)
+                }
+                for childProduct in product.childProducts {
+                    applyToProduct(childProduct, applying: operation)
+                }
+            }
+
+            let chains = moduleAlias.applyChainedAliases(observabilityScope)
+            let hasDivergingAliasChains = moduleAlias.terminalAliases.count > 1
+
+            for productInfo in moduleAlias.products {
+                applyToProduct(productInfo.identity) { module in
+                    // Case 1: Add intermediate aliased names if there are existing alias chains (i.e. a module
+                    // that has an alias that is overridden by another alias).
+                    for chain in chains {
+                        let terminalAlias = chain.terminalAlias
+                        let chainWithoutTerminal = chain.chain.dropLast()
+//                        let consumingPackagesToAlias = chain.consumingPackagesToAlias
+
+                        for intermediate in chainWithoutTerminal {
+                            // "canonical was once known as intermediate.name"
+//                            module.addPrechainModuleAlias(for: intermediate.overridenName, as: intermediate.name)
+                            // "intermediate.name is now overridden by terminal"
+//                            module.addPrechainModuleAlias(for: intermediate.name, as: terminalAlias.name)
+//                            module.addModuleAlias(for: intermediate., as: <#T##String#>)
+                            // let packageDeclaringAlias = intermediate.declaringPackage
+                            module.addModuleAlias(for: intermediate.overridenName, as: terminalAlias.name)
+
+                            observabilityScope.emit(info: "Module alias '\(intermediate.name)' defined in package '\(intermediate.declaringPackage)' for target '\(module.name)' in package/product '\(productInfo.name)' is overridden by alias '\(terminalAlias.name)'; if this override is not intended, remove '\(terminalAlias.name)' from 'moduleAliases' in its manifest")
+                        }
+
+                        module.addModuleAlias(for: terminalAlias.overridenName, as: terminalAlias.name)
+
+                        // Handle case where there are diverging alias chains.
+                        if hasDivergingAliasChains {
+
+                        }
+                    }
+                    // Case 2: Single module has diverging chained alias paths, resulting in multiple
+                    // terminal aliases (i.e. the final aliased name(s) for which this module is referred to
+                    // at the topmost level of the package graph).
+//                    if hasDivergingAliasChains {
+////                        module.addDirectRefAliases(for: moduleAlias.module.name, as: moduleAlias.terminalAliases.map(\.name))
+//                        for chain in chains {
+//                            // todo not actually entirely right
+//                            module.addModuleAlias(for: module.name, as: chain.terminalAlias.name)
+//                        }
+//                    } else {
+//                        // Case 3: A module only has a singular terminal alias, no diverging paths detected.
+//                        let canonicalModuleName = moduleAlias.module.name
+//                        guard let terminalAlias = moduleAlias.terminalAliases.first else { return }
+//                        module.addModuleAlias(for: canonicalModuleName, as: terminalAlias.name)
+//                    }
+
+                    // Check against non swift files in the module's sources and warn accordingly.
+                    if module.sources.containsNonSwiftFiles,
+                       let aliases = module.moduleAliases {
+                            let aliasesMsg = aliases.map({ "'\($0.key)' as '\($0.value)'" }).joined(separator: ", ")
+                        observabilityScope.emit(warning: "target '\(module.name)' for product '\(productInfo.name)' from package '\(productInfo.package ?? "")' has module aliases: [\(aliasesMsg)] but may contain non-Swift sources; there might be a conflict among non-Swift symbols")
+                    }
+                }
+            }
+        }
+
+        // Address modules across differing packages that have the same name;
+        // must add a direct ref to these modules with the possible aliases.
+//        for moduleAlias in self.moduleAliases {
+//            var visitedProducts: Set<String> = []
+//            func applyToProduct(_ product: String, applying operation: (Module) -> Void) {
+//                guard visitedProducts.insert(product).inserted else { return }
+//                guard let product = self.productModules[product] else { return }
+//                for moduleInfo in product.allTransitiveModules {
+//                    operation(moduleInfo.module)
+//                }
+//                for childProduct in product.childProducts {
+//                    applyToProduct(childProduct, applying: operation)
+//                }
+//            }
+//
+//            if let conflictingModules = moduleNameToAlias[moduleAlias.module.name], conflictingModules.count > 1  {
+//                let allTerminalAliases = conflictingModules.flatMap({ $0.terminalAliases })
+//                for productInfo in conflictingModules.flatMap({ $0.products }) {
+//                    applyToProduct(productInfo.identity) { module in
+//                        module.addDirectRefAliases(for: moduleAlias.module.name, as: allTerminalAliases.map(\.name))
+//                    }
+//                }
+//            }
+//        }
+
+        // Apply all aliases
+        for moduleAlias in self.moduleAliases {
+            // All cases addressed;
+            // Apply the alias to the module.
+            moduleAlias.applyAlias()
+        }
+
+        // Diagnose unapplied aliases.
+        for moduleAlias in self.moduleAliases where moduleAlias.terminalAliases.isEmpty {
+            if let diagnosedAlias = moduleAlias.aliases.first(where: { $0.overridenName == moduleAlias.module.name }) {
+                // diagnose
+                observabilityScope.emit(warning: "module alias for target '\(moduleAlias.module.name)', declared in package '\(diagnosedAlias.declaringPackage)', does not match any recursive target dependency of product '\(diagnosedAlias.product.name)' from package '\(moduleAlias.package.description)'")
+            }
+        }
+    }
+}
+
+private class ModuleAlias: Identifiable {
+    typealias ID = ModuleAliasID
+    var module: Module
+    var products: Set<ProductInfo> = []
+    let package: PackageIdentity
+    /// Flat list of all aliases (chained, etc.) for this module.
+    var aliases: IdentifiableSet<Alias> = []
+    var reverseLookupAliases: [Alias.AliasId: [Alias.AliasId]] = [:]
+    /// A list of paths of chained aliases, if applicable. The returned Alias represents the terminal alias in the chain.
+    /// It's possible that there are multiple terminal aliases for a singular module depending on whether the alias
+    /// chains have diverged in the package graph.
+//    var aliasChains: [PackageIdentity: [Alias]] = [:]
+    /// Represents all terminal aliases (i.e. the final overridden name for a module) in the package graph.
+    public private(set) var terminalAliases: [Alias] = []
+
+    /// The ID of this ModuleAlias object, representing a given module and its origin package.
+    public struct ModuleAliasID: Hashable {
+        var moduleName: String
+        var packageIdentity: PackageIdentity
+    }
+
+    public var id: ID {
+        .init(moduleName: module.name, packageIdentity: package)
+    }
+
+    struct Alias: Identifiable {
+        /// The new name in which the module is to be referred to.
+        let name: String
+        /// The module's old name.
+        let overridenName: String
+        /// The product dependency being consumed by `declaringPackage` in which
+        /// `overridenName` is exposed — either as a canonical module name (direct alias)
+        /// or as a prior alias name (chained alias).
+        let product: Module.ProductReference
+        /// The package consuming the product dependency and declaring the alias.
+        let declaringPackage: PackageIdentity
+        /// The package that defined the overriddenName of this alias.
+        let originatingPackage: PackageIdentity
+
+        struct AliasId: Hashable {
+            var name: String
+            var declaringPackage: PackageIdentity
+        }
+
+        public var id: AliasId {
+            .init(
+                name: name,
+                declaringPackage: declaringPackage
+            )
+        }
+
+        public var reverseId: AliasId {
+            .init(
+                name: overridenName,
+                declaringPackage: declaringPackage
+            )
+        }
+    }
+
+    struct ProductInfo: Hashable {
+        public let name: String
+        public let identity: String
+        public let package: String?
+
+        public init(_ productRef: Module.ProductReference) {
+            self.name = productRef.name
+            self.identity = productRef.identity
+            self.package = productRef.package
+        }
+    }
+
+    init(
+        module: Module,
+        package: PackageIdentity
+    ) {
+        self.module = module
+        self.package = package
+    }
+
+    struct AliasChain {
+        lazy var consumingPackagesToAlias: [PackageIdentity: Alias] = {
+            var result: [PackageIdentity: Alias] = [:]
+
+            for alias in chain {
+                result[alias.declaringPackage] = alias
+            }
+
+            return result
+        }()
+        var chain: [Alias]
+        var terminalAlias: Alias
+    }
+
+    @discardableResult
+    public func applyChainedAliases(_ observabilityScope: ObservabilityScope) -> [AliasChain] {
+        let continuedIds = Set(self.aliases.map(\.reverseId))
+        let terminalAliases = aliases.filter({ !continuedIds.contains($0.id) })
+        self.terminalAliases = terminalAliases
+
+        var results: [AliasChain] = []
+
+        // Traverse the chain beginning with the terminal aliases.
+        for terminalAlias in terminalAliases {
+            var chain: [Alias] = []
+            var current: Alias? = terminalAlias
+            while let alias = current {
+                chain.append(alias)
+                current = self.aliases[alias.reverseId]
+            }
+
+            chain.reverse()
+            results.append(.init(chain: chain, terminalAlias: terminalAlias))
+        }
+
+        return results
+    }
+
+    func applyAlias() {
+        self.module.applyAlias()
+    }
+
+    func canChainAlias(alias: Alias) -> Bool {
+        // Check either that this alias overrides another alias OR is being overriden by an existing alias.
+        return self.aliases[.init(name: alias.overridenName, declaringPackage: alias.originatingPackage)] != nil || self.aliases.contains(where: { $0.reverseId == alias.id })
+    }
+
+    func addAlias(_ alias: Alias) throws {
+        try self.addAlias(
+            alias.name,
+            oldName: alias.overridenName,
+            alias.declaringPackage,
+            alias.product,
+            alias.originatingPackage
+        )
+    }
+
+    func addAlias(_ alias: String, oldName: String, _ consumingPackage: PackageIdentity, _ productRef: Module.ProductReference, _ originatingPackage: PackageIdentity) throws {
+        // Add to list of products that this module is a dependency of.
+        self.products.insert(.init(productRef))
+
+        // Create alias.
+        let alias = Alias(name: alias, overridenName: oldName, product: productRef, declaringPackage: consumingPackage, originatingPackage: originatingPackage)
+
+        let (inserted, existing) = self.aliases.insert(alias)
+        if inserted {
+            // Also insert in reverse-lookup
+            self.reverseLookupAliases[alias.reverseId, default: []].append(alias.id)
+        }
+        if !inserted && existing.name != alias.name {
+            // Not referring to the same
+            if existing.product.package != self.package.description {
+                // shouldnt ever get here, todo remove
+            } else {
+                throw PackageGraphError.multipleModuleAliases(
+                    module: alias.overridenName,
+                    product: productRef.name,
+                    package: self.package.description,
+                    aliases: self.aliases.map{$0.name} + [alias.name]
+                )
+            }
+        }
     }
 }
