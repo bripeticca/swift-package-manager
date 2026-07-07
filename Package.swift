@@ -135,9 +135,9 @@ if shouldUseSwiftBuildFramework {
 let package = Package(
     name: "SwiftPM",
     platforms: [
-        .macOS(.v14),
-        .iOS(.v17),
-        .macCatalyst(.v17),
+        .macOS(.v15),
+        .iOS(.v18),
+        .macCatalyst(.v18),
     ],
     products:
     autoProducts.flatMap {
@@ -613,6 +613,9 @@ let package = Package(
                 "PackageCollections",
                 "PackageModel",
             ],
+            exclude: [
+                "CMakeLists.txt",
+            ],
             swiftSettings: commonExperimentalFeatures
         ),
 
@@ -705,7 +708,10 @@ let package = Package(
         .executableTarget(
             /** Interacts with package collections */
             name: "swift-package-collection",
-            dependencies: ["PackageCollectionsCommand"]
+            dependencies: ["PackageCollectionsCommand"],
+            exclude: [
+                "CMakeLists.txt",
+            ],
         ),
         .executableTarget(
             /** Multi-command entry point for SwiftPM. */
@@ -722,7 +728,10 @@ let package = Package(
         .executableTarget(
             /** Interact with package registry */
             name: "swift-package-registry",
-            dependencies: ["PackageRegistryCommand"]
+            dependencies: ["PackageRegistryCommand"],
+            exclude: [
+                "CMakeLists.txt",
+            ],
         ),
         .executableTarget(
             /** Utility to produce the artifacts for prebuilts */
@@ -1130,7 +1139,7 @@ if ProcessInfo.processInfo.environment["SWIFTCI_USE_LOCAL_DEPS"] == nil {
         .package(url: "https://github.com/apple/swift-system.git", revision: "1.5.0"),
         .package(url: "https://github.com/apple/swift-collections.git", revision: "1.1.6"),
         .package(url: "https://github.com/apple/swift-certificates.git", revision: "1.10.1"),
-        .package(url: "https://github.com/swiftlang/swift-toolchain-sqlite.git", revision: "1.0.7"),
+        .package(url: "https://github.com/swiftlang/swift-toolchain-sqlite.git", revision: "1.0.9"),
         // Not in toolchain, used for use in previewing documentation
         .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.1.0"),
     ]

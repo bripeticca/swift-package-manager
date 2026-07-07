@@ -38,6 +38,7 @@ import struct PackageModel.Platform
 import struct PackageModel.PlatformDescription
 import struct PackageModel.PlatformRegistry
 import struct PackageModel.PlatformsCondition
+import struct PackageModel.PlatformVersion
 import class PackageModel.PluginModule
 import class PackageModel.Product
 import enum PackageModel.ProductType
@@ -460,7 +461,7 @@ extension PackageGraph.ResolvedModule {
                 iOSVersion: iOSDeploymentTarget
             )
 
-            if let mappedVersion {
+            if let mappedVersion, PlatformVersion(mappedVersion) >= targetPlatform.oldestSupportedVersion {
                 deploymentTargets[targetPlatform] = mappedVersion
             }
         }
@@ -574,7 +575,12 @@ extension PackageGraph.ResolvedModule {
     }
 
     func productRepresentingDependencyOfBuildPlugin(in mainModuleProducts: [ResolvedProduct]) -> ResolvedProduct? {
-        mainModuleProducts.only { (mainModuleProduct: ResolvedProduct) -> Bool in
+        // When a dependency package has an explicit product with a different name than the
+        // executable target (e.g. product "PluginExecutable2" wrapping target "PluginExecutable"),
+        // SwiftPM also auto-promotes an implicit product with the target's name for plugin use.
+        // Both match the predicate below, causing `only` to return nil. Prefer explicit products
+        // to resolve this ambiguity correctly.
+        func matchesDependency(_ mainModuleProduct: ResolvedProduct) -> Bool {
             // Handle binary-only executable products that don't have a main module, i.e. binaryTarget
             guard let mainModule = mainModuleProduct.mainModule else {
                 return mainModuleProduct.type == .executable &&
@@ -589,6 +595,14 @@ extension PackageGraph.ResolvedModule {
                 mainModule.name == self.name
             // Intentionally ignore the build triple!
         }
+
+        let explicitMatch = mainModuleProducts
+            .filter { !$0.underlying.isImplicit }
+            .only(where: matchesDependency)
+        if let explicitMatch {
+            return explicitMatch
+        }
+        return mainModuleProducts.only(where: matchesDependency)
     }
 
     struct AllBuildSettings {
@@ -956,8 +970,8 @@ extension PackageGraph.ResolvedProduct {
 }
 
 extension PackageGraph.ResolvedModule {
-    func recursivelyTraverseDependencies(with block: (ResolvedModule.Dependency) -> Void) {
-        [self].recursivelyTraverseDependencies(with: block)
+    func recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: Bool, with block: (ResolvedModule.Dependency) -> Void) {
+        [self].recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: includeMacroDependencies, with: block)
     }
 
     func addParseAsLibrarySettings(to settings: inout BuildSettings, toolsVersion: ToolsVersion, fileSystem: FileSystem) {
@@ -983,9 +997,9 @@ extension PackageGraph.ResolvedModule {
 }
 
 extension Collection<PackageGraph.ResolvedModule> {
-    /// Recursively applies a block to each of the *dependencies* of the given module, in topological sort order.
+    /// Recursively applies a block to each of the linkage dependencies of the given module, in topological sort order.
     /// Each module or product dependency is visited only once.
-    func recursivelyTraverseDependencies(with block: (ResolvedModule.Dependency) -> Void) {
+    func recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: Bool, with block: (ResolvedModule.Dependency) -> Void) {
         var moduleIDsSeen: Set<ResolvedModule.ID> = []
         var productIDsSeen: Set<ResolvedProduct.ID> = []
 
@@ -995,10 +1009,20 @@ extension Collection<PackageGraph.ResolvedModule> {
                 let (unseenModule, _) = moduleIDsSeen.insert(moduleDependency.id)
                 guard unseenModule else { return }
 
-                // Do not traverse into *macro* or *plugin* dependencies.
-                // Macros run at compile time and their dependencies should not be linked into the client.
-                // Plugins run at build time and their dependencies should not be linked into the client neither.
-                if ![.macro, .plugin].contains(moduleDependency.underlying.type) {
+                // Do not traverse into *macro* or *plugin* dependencies unless explicitly requested.
+                // Macros run at compile time and their dependencies should not be linked into the client, unless a client includes their testable variant.
+                // Plugins run at build time and their dependencies should not be linked into the client.
+                let stopTraversal: Bool
+                switch moduleDependency.type {
+                case .macro:
+                    stopTraversal = !includeMacroDependencies
+                case .plugin:
+                    stopTraversal = true
+                default:
+                    stopTraversal = false
+                }
+
+                if !stopTraversal {
                     for dependency in moduleDependency.dependencies {
                         visitDependency(dependency)
                     }

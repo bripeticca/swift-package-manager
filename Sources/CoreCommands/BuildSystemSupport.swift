@@ -42,7 +42,9 @@ private struct NativeBuildSystemFactory: BuildSystemFactory {
         _ = try await swiftCommandState.getRootPackageInformation(enableAllTraits)
         let testEntryPointPath = productsBuildParameters?.testProductStyle.explicitlySpecifiedEntryPointPath
         let cacheBuildManifest = if cacheBuildManifest {
-            try await self.swiftCommandState.canUseCachedBuildManifest()
+            try await self.swiftCommandState.canUseCachedBuildManifest(
+                buildDescriptionPath: BuildOperation.buildDescriptionPath(for: try productsBuildParameters ?? self.swiftCommandState.productsBuildParameters)
+            )
         } else {
             false
         }
@@ -143,6 +145,7 @@ private struct SwiftBuildSystemFactory: BuildSystemFactory {
             ),
             delegate: delegate,
             scratchDirectory: self.swiftCommandState.scratchDirectory,
+            shouldDisableSandbox: self.swiftCommandState.shouldDisableSandbox,
         )
     }
 }

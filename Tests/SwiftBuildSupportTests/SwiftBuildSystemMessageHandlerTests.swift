@@ -480,10 +480,27 @@ struct SwiftBuildSystemMessageHandlerTests {
         #expect(self.observability.diagnostics.count == 0)
 
         let output = self.outputStream.bytes.description
-        #expect(output.contains("Weird percent"))
-        #expect(!output.contains("12 / 32"))
-        #expect(output.contains("Something useful"))
-        #expect(output.contains("Complete"))
+        #expect(output.contains("[Weird percent]"))
+        #expect(output.contains("[12 / 32]"))
+        #expect(output.contains("[Something useful]"))
+        #expect(output.contains("[Complete]"))
+    }
+
+    @Test
+    func testVerboseTaskOutputEndsWithNewline() throws {
+        let messageHandler = self.messageHandler.debug
+
+        let events: [SwiftBuildMessage] = [
+            .taskStartedInfo(executionDescription: "Compile Foo"),
+            .taskCompleteInfo(result: .success)
+        ]
+
+        for event in events {
+            _ = try messageHandler.emitEvent(event)
+        }
+
+        let output = self.outputStream.bytes.description
+        #expect(output.contains("Compile Foo\n"))
     }
 }
 
