@@ -125,7 +125,7 @@ extension PackagePIFProjectBuilder {
             settings[.SWIFT_MODULE_ALIASES] = list.isEmpty ? nil : list
         }
 
-        if product.type == .executable {
+        if pifProductType == .executable {
             // Don't install the Swift module of the executable product, lest it conflict with the testable variant.
             // The contents of the testable variant's module will exactly match the binary linked by dependencies (test targets).
             // Also, multiple executable products may incorporate sources from the same executable target, while the testable
@@ -147,6 +147,21 @@ extension PackagePIFProjectBuilder {
                     "$(RPATH_ORIGIN)/../Frameworks",
                     "$(inherited)"
                 ]
+
+                // Apple platforms build xctest bundles for tests, so need an rpath relative to the embedded executable
+                // to reach adjacent build products.
+                if product.type == .test {
+                    settings[single: "APPLE_TEST_BUNDLE_RPATH"] = "$(APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_$(SHALLOW_BUNDLE:default=NO))"
+                    settings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_YES"] = "@loader_path/../.."
+                    settings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_NO"] = "@loader_path/../../.."
+
+                    for platform in [BuildSettings.Platform.macOS, .macCatalyst, .driverKit, .iOS, .watchOS, .tvOS, .xrOS] {
+                        settings[.LD_RUNPATH_SEARCH_PATHS, platform] = [
+                            "$(APPLE_TEST_BUNDLE_RPATH)",
+                            "$(inherited)"
+                        ]
+                    }
+                }
             }
             settings[.GENERATE_INFOPLIST_FILE] = "YES"
             settings[.SKIP_INSTALL] = "NO"
@@ -267,7 +282,7 @@ extension PackagePIFProjectBuilder {
 
         // Add any additional resource files emitted by synthesized build commands
         let generatedResourceFiles: [String] = {
-            var generatedResourceFiles = generatedFiles.resources.keys.map(\.pathString)
+            var generatedResourceFiles = generatedFiles.sortedResourcePaths.map(\.pathString)
             generatedResourceFiles.append(
                 contentsOf: addBuildToolCommands(
                     from: synthesizedResourceGeneratingPluginInvocationResults,
@@ -353,7 +368,7 @@ extension PackagePIFProjectBuilder {
                     sourceModuleTargetKeyPath: mainModuleTargetKeyPath,
                     resourceBundleTargetKeyPath: resourceBundleTargetKeyPath,
                     sourceFilePaths: generatedFiles.sources.map(\.self),
-                    resourceFilePaths: generatedFiles.resources.keys.map(\.pathString)
+                    resourceFilePaths: generatedFiles.sortedResourcePaths.map(\.pathString)
                 )
             } else {
                 // Generated resources always trigger the creation of a bundle accessor.
@@ -370,17 +385,37 @@ extension PackagePIFProjectBuilder {
                     sourceModuleTargetKeyPath: mainModuleTargetKeyPath,
                     resourceBundleTargetKeyPath: mainModuleTargetKeyPath,
                     sourceFilePaths: generatedFiles.sources.map(\.self),
-                    resourceFilePaths: generatedFiles.resources.keys.map(\.pathString)
+                    resourceFilePaths: generatedFiles.sortedResourcePaths.map(\.pathString)
                 )
             }
         }
 
         // Handle the main target's dependencies (and link against them).
         var mainModuleTarget = self.project[keyPath: mainModuleTargetKeyPath]
-        // If this is a test target, include dependencies of macros, as we will be linking their testable variant.
-        mainModule.recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: product.type == .test) { dependency in
+
+        // A test target links the testable variant of any macro that is a direct dependency, so that the macro's
+        // implementation can be unit tested. For such macros we also need to traverse into (and link) the macro's own
+        // dependencies. Macros which are transitive dependencies do not link the testable variant.
+        let directMacroDependencyIDs: Set<ResolvedModule.ID>
+        if product.type == .test {
+            directMacroDependencyIDs = Set(mainModule.dependencies.compactMap { dependency in
+                // Macros are always represented by a target in the manifest, so a product dependency can never
+                // be a direct dependency on a macro implementation.
+                guard case .module(let moduleDependency, _) = dependency, moduleDependency.type == .macro else {
+                    return nil
+                }
+                return moduleDependency.id
+            })
+        } else {
+            directMacroDependencyIDs = []
+        }
+
+        mainModule.recursivelyTraverseTransitiveLinkageDependencies(
+            includeDependenciesOfMacros: directMacroDependencyIDs,
+            toolsVersion: self.package.manifest.toolsVersion
+        ) { dependency, dependencyPlatformFilters in
             switch dependency {
-            case .module(let moduleDependency, let packageConditions):
+            case .module(let moduleDependency, _):
                 // This assertion is temporarily disabled since we may see targets from
                 // _other_ packages, but this should be resolved; see rdar://95467710.
                 /* assert(moduleDependency.packageName == self.package.name) */
@@ -394,12 +429,11 @@ extension PackagePIFProjectBuilder {
                     let binaryFileRef = self.binaryGroup.addFileReference { id in
                         Self.createBinaryModuleFileReference(binaryModule, id: id)
                     }
-                    let toolsVersion = self.package.manifest.toolsVersion
                     mainModuleTarget.addLibrary { id in
                         BuildFile(
                             id: id,
                             fileRef: binaryFileRef,
-                            platformFilters: packageConditions.toPlatformFilter(toolsVersion: toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             codeSignOnCopy: true,
                             removeHeadersOnCopy: true
                         )
@@ -410,8 +444,7 @@ extension PackagePIFProjectBuilder {
                     let dependencyId = moduleDependency.pifTargetGUID
                     mainModuleTarget.common.addDependency(
                         on: dependencyId,
-                        platformFilters: packageConditions
-                            .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                        platformFilters: dependencyPlatformFilters,
                         linkProduct: false
                     )
                     log(.debug, indent: 1, "Added use of plugin target '\(dependencyId)'")
@@ -420,18 +453,15 @@ extension PackagePIFProjectBuilder {
                     let dependencyId = moduleDependency.pifTargetGUID
                     mainModuleTarget.common.addDependency(
                         on: dependencyId,
-                        platformFilters: packageConditions
-                            .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                        platformFilters: dependencyPlatformFilters,
                         linkProduct: false
                     )
                     log(.debug, indent: 1, "Added dependency on product '\(dependencyId)'")
 
-                    // Link with a testable version of the macro if appropriate.
-                    if product.type == .test {
+                    if directMacroDependencyIDs.contains(moduleDependency.id) {
                         mainModuleTarget.common.addDependency(
                             on: moduleDependency.pifTargetGUID(suffix: .testable),
-                            platformFilters: packageConditions
-                                .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             linkProduct: true
                         )
                         log(
@@ -449,8 +479,7 @@ extension PackagePIFProjectBuilder {
                         let productDependencyGUID = productDependency.pifTargetGUID
                         mainModuleTarget.common.addDependency(
                             on: productDependencyGUID,
-                            platformFilters: packageConditions
-                                .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             linkProduct: false
                         )
                         log(.debug, indent: 1, "Added dependency on product '\(productDependencyGUID)'")
@@ -462,8 +491,7 @@ extension PackagePIFProjectBuilder {
                         let moduleDependencyGUID = moduleDependency.pifTargetGUID(suffix: .testable)
                         mainModuleTarget.common.addDependency(
                             on: moduleDependencyGUID,
-                            platformFilters: packageConditions
-                                .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             // Only link the testable version of executables which use Swift, as we do not currently support renaming entrypoints written in other languages.
                             linkProduct: moduleDependency.usesSwift
                         )
@@ -475,8 +503,7 @@ extension PackagePIFProjectBuilder {
                     let dependencyGUID = moduleDependency.pifTargetGUID
                     mainModuleTarget.common.addDependency(
                         on: dependencyGUID,
-                        platformFilters: packageConditions
-                            .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                        platformFilters: dependencyPlatformFilters,
                         linkProduct: shouldLinkProduct
                     )
                     log(
@@ -486,11 +513,11 @@ extension PackagePIFProjectBuilder {
                     )
                 }
 
-            case .product(let productDependency, let packageConditions):
+            case .product(let productDependency, _):
                 let isLinkable = productDependency.isLinkable
                 self.handleProduct(
                     productDependency,
-                    with: packageConditions,
+                    platformFilters: dependencyPlatformFilters,
                     isLinkable: isLinkable,
                     target: &mainModuleTarget,
                     settings: &settings
@@ -529,7 +556,7 @@ extension PackagePIFProjectBuilder {
         let moduleOrProduct = PackagePIFBuilder.ModuleOrProduct(
             type: moduleOrProductType,
             name: product.name,
-            moduleName: product.c99name,
+            moduleName: mainModule.c99name,
             pifTarget: .target(self.project[keyPath: mainModuleTargetKeyPath]),
             indexableFileURLs: indexableFileURLs,
             headerFiles: headerFiles,
@@ -543,13 +570,13 @@ extension PackagePIFProjectBuilder {
         self.builtModulesAndProducts.append(moduleOrProduct)
 
         if moduleOrProductType == .unitTest {
-            try makeTestRunnerProduct(for: moduleOrProduct)
+            try makeTestRunnerProduct(for: moduleOrProduct, unitTestModule: mainModule)
         }
     }
 
     private func handleProduct(
         _ product: PackageGraph.ResolvedProduct,
-        with packageConditions: [PackageModel.PackageCondition],
+        platformFilters: Set<ProjectModel.PlatformFilter>,
         isLinkable: Bool,
         target: inout ProjectModel.Target,
         settings: inout ProjectModel.BuildSettings
@@ -563,7 +590,7 @@ extension PackagePIFProjectBuilder {
             let shouldLinkProduct = isLinkable
             target.common.addDependency(
                 on: product.pifTargetGUID,
-                platformFilters: packageConditions.toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                platformFilters: platformFilters,
                 linkProduct: shouldLinkProduct
             )
             log(
@@ -609,6 +636,10 @@ extension PackagePIFProjectBuilder {
                 fatalError("Could not assign dynamic PIF target")
             }
             self.project[keyPath: pifTargetKeyPath].dynamicTargetVariantId = dynamicPifTarget.id
+
+            for module in libraryProduct.modules where module.isSourceModule {
+                self.modulesInPromotableAutomaticLibraries[module.name, default: []].insert(pifTarget.id)
+            }
         }
     }
 
@@ -738,8 +769,13 @@ extension PackagePIFProjectBuilder {
             // For dynamic libraries, track which source modules are DIRECT dependencies so we can set
             // SWIFT_COMPILE_FOR_STATIC_LINKING=NO on Windows for those modules.
             // Collect only DIRECT module dependencies (not recursive)
-            for module in product.modules where module.isSourceModule {
-                self.modulesInDynamicLibraries.insert(module.name)
+            //
+            // Skip the synthesized dynamic variant of an `.automatic` product: its modules are still
+            // linked statically by default, so flagging them here would compile them incorrectly.
+            if targetSuffix != .dynamic {
+                for module in product.modules where module.isSourceModule {
+                    self.modulesInDynamicLibraries.insert(module.name)
+                }
             }
         } else if productType == .staticArchive {
             settings[.TARGET_NAME] = product.targetName()
@@ -776,9 +812,12 @@ extension PackagePIFProjectBuilder {
         // against them).
         var libraryUmbrellaTarget = self.project[keyPath: libraryUmbrellaTargetKeyPath]
         let mainModuleProducts = package.products.filter(\.isMainModuleProduct)
-        product.modules.recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: false) { dependency in
+        product.modules.recursivelyTraverseTransitiveLinkageDependencies(
+            includeDependenciesOfMacros: [],
+            toolsVersion: package.manifest.toolsVersion
+        ) { dependency, dependencyPlatformFilters in
             switch dependency {
-            case .module(let moduleDependency, let packageConditions):
+            case .module(let moduleDependency, _):
                 // This assertion is temporarily disabled since we may see targets from
                 // _other_ packages, but this should be resolved; see rdar://95467710.
                 /* assert(moduleDependency.packageName == self.package.name) */
@@ -792,12 +831,11 @@ extension PackagePIFProjectBuilder {
                     let binaryFileRef = self.binaryGroup.addFileReference { id in
                         FileReference(id: id, path: binaryTarget.artifactPath.pathString)
                     }
-                    let toolsVersion = package.manifest.toolsVersion
                     libraryUmbrellaTarget.addLibrary { id in
                         BuildFile(
                             id: id,
                             fileRef: binaryFileRef,
-                            platformFilters: packageConditions.toPlatformFilter(toolsVersion: toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             codeSignOnCopy: true,
                             removeHeadersOnCopy: true
                         )
@@ -810,8 +848,7 @@ extension PackagePIFProjectBuilder {
                     let dependencyId = moduleDependency.pifTargetGUID
                     libraryUmbrellaTarget.common.addDependency(
                         on: dependencyId,
-                        platformFilters: packageConditions
-                            .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                        platformFilters: dependencyPlatformFilters,
                         linkProduct: false
                     )
                     log(.debug, indent: 1, "Added use of plugin target '\(dependencyId)'")
@@ -829,8 +866,7 @@ extension PackagePIFProjectBuilder {
                     {
                         libraryUmbrellaTarget.common.addDependency(
                             on: product.pifTargetGUID,
-                            platformFilters: packageConditions
-                                .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                            platformFilters: dependencyPlatformFilters,
                             linkProduct: false
                         )
                         log(.debug, indent: 1, "Added dependency on product '\(product.pifTargetGUID)'")
@@ -846,12 +882,12 @@ extension PackagePIFProjectBuilder {
 
                 libraryUmbrellaTarget.common.addDependency(
                     on: moduleDependency.pifTargetGUID,
-                    platformFilters: packageConditions.toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                    platformFilters: dependencyPlatformFilters,
                     linkProduct: true
                 )
                 log(.debug, indent: 1, "Added linked dependency on target '\(moduleDependency.pifTargetGUID)'")
 
-            case .product(let productDependency, let packageConditions):
+            case .product(let productDependency, _):
                 // Do not add a dependency for binary-only executable products since they are not part of the build.
                 if productDependency.isBinaryOnlyExecutableProduct {
                     return
@@ -864,8 +900,7 @@ extension PackagePIFProjectBuilder {
                     let shouldLinkProduct = productDependency.isLinkable
                     libraryUmbrellaTarget.common.addDependency(
                         on: productDependency.pifTargetGUID,
-                        platformFilters: packageConditions
-                            .toPlatformFilter(toolsVersion: package.manifest.toolsVersion),
+                        platformFilters: dependencyPlatformFilters,
                         linkProduct: shouldLinkProduct
                     )
                     log(
@@ -1052,7 +1087,7 @@ extension PackagePIFProjectBuilder {
     }
 
     // MARK: - Test Runners
-    mutating func makeTestRunnerProduct(for unitTestProduct: PackagePIFBuilder.ModuleOrProduct) throws {
+    mutating func makeTestRunnerProduct(for unitTestProduct: PackagePIFBuilder.ModuleOrProduct, unitTestModule: ResolvedModule) throws {
         // Only generate a test runner for root packages with tests.
         guard pifBuilder.delegate.isRootPackage else {
             return
@@ -1085,7 +1120,6 @@ extension PackagePIFProjectBuilder {
         settings[.PRODUCT_BUNDLE_IDENTIFIER] = "\(self.package.identity).\(name)"
             .spm_mangledToBundleIdentifier()
         settings[.SKIP_INSTALL] = "NO"
-        settings[.SWIFT_VERSION] = "5.0"
         // This should eventually be set universally for all package targets/products.
         settings[.LINKER_DRIVER] = "swiftc"
 
@@ -1123,11 +1157,22 @@ extension PackagePIFProjectBuilder {
             linkProduct: true
         )
 
+        // Apply user-specified settings on the test target to the test runner. This is especially important
+        // of e.g. linker settings specify a linked library external to the package.
+        var debugSettings: ProjectModel.BuildSettings = settings
+        var releaseSettings: ProjectModel.BuildSettings = settings
+        let allBuildSettings = unitTestModule.computeAllBuildSettings(observabilityScope: pifBuilder.observabilityScope, forRemotePackage: pifBuilder.delegate.isRemote)
+        allBuildSettings.apply(to: &debugSettings, for: .debug)
+        allBuildSettings.apply(to: &releaseSettings, for: .release)
+
+        debugSettings[.SWIFT_VERSION] = "5.0"
+        releaseSettings[.SWIFT_VERSION] = "5.0"
+
         self.project[keyPath: testRunnerTargetKeyPath].common.addBuildConfig { id in
             BuildConfig(
                 id: id,
                 name: "Debug",
-                settings: settings,
+                settings: debugSettings,
                 impartedBuildSettings: impartedSettings
             )
         }
@@ -1135,7 +1180,7 @@ extension PackagePIFProjectBuilder {
             BuildConfig(
                 id: id,
                 name: "Release",
-                settings: settings,
+                settings: releaseSettings,
                 impartedBuildSettings: impartedSettings
             )
         }

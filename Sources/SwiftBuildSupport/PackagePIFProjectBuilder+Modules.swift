@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
+import struct TSCBasic.OrderedSet
 import TSCUtility
 
 import struct Basics.AbsolutePath
@@ -63,15 +64,15 @@ extension PackagePIFProjectBuilder {
         // Add the dependencies.
         var pluginTarget = self.project[keyPath: pluginTargetKeyPath]
         let mainModuleProducts = self.package.products.filter(\.isMainModuleProduct)
-        pluginModule.recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: false) { dependency in
+        pluginModule.recursivelyTraverseTransitiveLinkageDependencies(
+            includeDependenciesOfMacros: [],
+            toolsVersion: self.package.manifest.toolsVersion
+        ) { dependency, dependencyPlatformFilters in
             switch dependency {
-            case .module(let moduleDependency, let packageConditions):
+            case .module(let moduleDependency, _):
                 // This assertion is temporarily disabled since we may see targets from
                 // _other_ packages, but this should be resolved; see rdar://95467710.
                 /* assert(moduleDependency.packageName == self.package.name) */
-
-                let dependencyPlatformFilters = packageConditions
-                    .toPlatformFilter(toolsVersion: self.package.manifest.toolsVersion)
 
                 switch moduleDependency.type {
                 case .executable, .snippet:
@@ -103,7 +104,7 @@ extension PackagePIFProjectBuilder {
                     log(.debug, indent: 1, "Added dependency on target '\(dependencyGUID)'")
                 }
 
-            case .product(let productDependency, let packageConditions):
+            case .product(let productDependency, _):
                 // Do not add a dependency for binary-only executable products since they are not part of the build.
                 if productDependency.isBinaryOnlyExecutableProduct {
                     break
@@ -114,8 +115,6 @@ extension PackagePIFProjectBuilder {
                     buildSettings: &buildSettings
                 ) {
                     let dependencyGUID = productDependency.pifTargetGUID
-                    let dependencyPlatformFilters = packageConditions
-                        .toPlatformFilter(toolsVersion: self.package.manifest.toolsVersion)
 
                     pluginTarget.common.addDependency(
                         on: dependencyGUID,
@@ -338,7 +337,7 @@ extension PackagePIFProjectBuilder {
             let (result, resourceBundle) = try addResourceBundle(
                 for: sourceModule,
                 targetKeyPath: sourceModuleTargetKeyPath,
-                generatedResourceFiles: generatedFiles.resources.keys.map(\.pathString)
+                generatedResourceFiles: generatedFiles.sortedResourcePaths.map(\.pathString)
             )
             if let resourceBundle { self.builtModulesAndProducts.append(resourceBundle) }
 
@@ -376,7 +375,7 @@ extension PackagePIFProjectBuilder {
                 sourceModuleTargetKeyPath: sourceModuleTargetKeyPath,
                 resourceBundleTargetKeyPath: resourceBundleTargetKeyPath,
                 sourceFilePaths: generatedFiles.sources.map(\.self),
-                resourceFilePaths: generatedFiles.resources.keys.map(\.pathString)
+                resourceFilePaths: generatedFiles.sortedResourcePaths.map(\.pathString)
             )
         }
 
@@ -500,10 +499,19 @@ extension PackagePIFProjectBuilder {
 
             settings[.SWIFT_PACKAGE_NAME] = sourceModule.packageName
 
-            // On Windows, disable static linking mode when this module is a dependency of a dynamic library.
-            // This ensures the module is compiled correctly for linking into a dynamic library.
+            // On Windows, disable static linking mode when this module is a dependency of a dynamic library,
+            // or conditionally disable it when this module is a dependency of an automatic libray which can
+            // be promoted to dynamic. This ensures the module is compiled correctly for linking into a
+            // dynamic library.
             if self.modulesInDynamicLibraries.contains(sourceModule.name) {
                 settings[.SWIFT_COMPILE_FOR_STATIC_LINKING, .windows] = "NO"
+            }
+
+            if let promotableProductTargetIds = self.modulesInPromotableAutomaticLibraries[sourceModule.name] {
+                settings[
+                    .SWIFT_DISABLE_COMPILATION_FOR_STATIC_LINKING_WHEN_ANY_TARGET_IS_PROMOTED_TO_DYNAMIC,
+                    .windows
+                ] = promotableProductTargetIds.map(\.value).sorted()
             }
 
             // This entrypoint is only used for the testable variant of executable and macro targets. The primary PIF generation
@@ -527,6 +535,23 @@ extension PackagePIFProjectBuilder {
 
                 // on windows modules are libraries, so we need to add a search path so the linker finds them
                 impartedSettings[.LIBRARY_SEARCH_PATHS, .windows] = ["$(inherited)", "$(TARGET_BUILD_DIR)/ExecutableModules"]
+
+                // If the executable is promoted to a non-executable PIF product (e.g. a Swift Playgrounds
+                // application), the product target installs the Swift module itself, so suppress this testable
+                // variant's copy to avoid both writing BUILT_PRODUCTS_DIR/<module>.swiftmodule, which produces
+                // a build error of "Multiple commands produce...".
+                let productInstallsOwnModule = self.package.products.contains { product in
+                    guard product.isMainModuleProduct,
+                          product.mainModule?.name == sourceModule.name,
+                          [.executable, .snippet].contains(product.type) else {
+                        return false
+                    }
+                    let pifType = pifBuilder.delegate.customProductType(forExecutable: product.underlying) ?? .executable
+                    return pifType != .executable
+                }
+                if productInstallsOwnModule {
+                    settings[.SWIFT_INSTALL_MODULE] = "NO"
+                }
             }
 
             if let aliases = sourceModule.moduleAliases {
@@ -662,7 +687,7 @@ extension PackagePIFProjectBuilder {
             indexableFileURLs.append(SourceControlURL(fileURLWithPath: resource.path))
         }
 
-        let headerFiles = Set(sourceModule.headerFileAbsolutePaths)
+        let headerFiles = OrderedSet(sourceModule.headerFileAbsolutePaths)
 
         // Add the header files with project visibility for the purpose of exposing them
         // for symbol graph generation. For non-swift API that will be done using TAPI and
@@ -736,15 +761,15 @@ extension PackagePIFProjectBuilder {
         let shouldLinkProduct = (desiredModuleType == .dynamicLibrary) || (desiredModuleType == .macro)
         var moduleTarget = self.project[keyPath: sourceModuleTargetKeyPath]
         let moduleMainProducts = self.package.products.filter(\.isMainModuleProduct)
-        sourceModule.recursivelyTraverseTransitiveLinkageDependencies(includeMacroDependencies: false) { dependency in
+        sourceModule.recursivelyTraverseTransitiveLinkageDependencies(
+            includeDependenciesOfMacros: [],
+            toolsVersion: self.package.manifest.toolsVersion
+        ) { dependency, dependencyPlatformFilters in
             switch dependency {
-            case .module(let moduleDependency, let packageConditions):
+            case .module(let moduleDependency, _):
                 // This assertion is temporarily disabled since we may see targets from
                 // _other_ packages, but this should be resolved; see rdar://95467710.
                 /* assert(moduleDependency.packageName == self.package.name) */
-
-                let dependencyPlatformFilters = packageConditions
-                    .toPlatformFilter(toolsVersion: self.package.manifest.toolsVersion)
 
                 switch moduleDependency.type {
                 case .executable, .snippet:
@@ -820,7 +845,7 @@ extension PackagePIFProjectBuilder {
                     )
                 }
 
-            case .product(let productDependency, let packageConditions):
+            case .product(let productDependency, _):
                 // Do not add a dependency for binary-only executable products since they are not part of the build.
                 if productDependency.isBinaryOnlyExecutableProduct {
                     return
@@ -830,8 +855,6 @@ extension PackagePIFProjectBuilder {
                     product: productDependency.underlying,
                     buildSettings: &settings
                 ) {
-                    let dependencyPlatformFilters = packageConditions
-                        .toPlatformFilter(toolsVersion: self.package.manifest.toolsVersion)
                     let shouldLinkProduct = shouldLinkProduct && productDependency.isLinkable
 
                     moduleTarget.common.addDependency(
@@ -929,7 +952,7 @@ extension PackagePIFProjectBuilder {
             moduleName: sourceModule.c99name,
             pifTarget: .target(self.project[keyPath: sourceModuleTargetKeyPath]),
             indexableFileURLs: indexableFileURLs,
-            headerFiles: headerFiles,
+            headerFiles: Set(headerFiles.contents),
             doccCatalogs: doccCatalogs,
             linkedPackageBinaries: linkedPackageBinaries,
             swiftLanguageVersion: sourceModule.packageSwiftLanguageVersion(manifest: packageManifest),

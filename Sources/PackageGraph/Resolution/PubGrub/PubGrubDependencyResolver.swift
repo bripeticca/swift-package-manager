@@ -39,6 +39,18 @@ public struct PubGrubDependencyResolver {
         /// refer to. This means an incompatibility can occur several times.
         public private(set) var incompatibilities: [DependencyResolutionNode: [Incompatibility]] = [:]
 
+        /// The resolver's own accumulated view of enabled traits per package, fed incrementally by
+        /// `addIncompatibility` as the resolver itself discovers each parent's request. A single
+        /// `DependencyResolutionNode` only ever carries whichever parent edge constructed it,
+        /// namely the traits that parent enabled on the dependency; this map represents the unified
+        /// trait enablement for a given package.
+        private var enabledTraitsMap = EnabledTraitsMap()
+
+        /// Already-decided packages whose `enabledTraitsMap` entry changed *after* they were
+        /// decided - detected inline in `addIncompatibility`, the instant a new request for an
+        /// already-decided package's traits arrives.
+        public var decisionsToRepair: Set<DependencyResolutionNode> = []
+
         /// The current best guess for a solution satisfying all requirements.
         public private(set) var solution: PartialSolution
 
@@ -53,10 +65,42 @@ public struct PubGrubDependencyResolver {
             self.solution = solution
         }
 
+        /// The traits to resolve a package with, including an outstanding request for that
+        /// package's defaults.
+        ///
+        /// Reading `enabledTraitsMap` directly hides that request behind any named traits, and a
+        /// dependency reachable only through a default trait is then never derived. The request
+        /// stays an unexpanded marker because expanding it needs the package's manifest. Callers
+        /// must already hold `lock`.
+        private func resolutionTraits(for identity: PackageIdentity) -> EnabledTraits {
+            let named = self.enabledTraitsMap[identity]
+            guard !named.contains("default"),
+                  let defaultSetter = self.enabledTraitsMap[defaultSettersFor: identity]?.first
+            else {
+                return named
+            }
+
+            return named.union(EnabledTraits(["default"], setBy: defaultSetter))
+        }
+
         func addIncompatibility(_ incompatibility: Incompatibility, at location: LogLocation) {
             self.lock.withLock {
-                // log("incompat: \(incompatibility) \(location)")
                 for package in incompatibility.terms.map(\.node) {
+                    // Pre-resolution computation ensures we already handled root package dependency requests,
+                    // and therefore should not need repairs.
+                    if !package.package.kind.isRoot {
+                        let identity = package.package.identity
+                        let previousDecisionEnabledTraits = self.resolutionTraits(for: identity)
+                        self.enabledTraitsMap[identity] = package.enabledTraits
+                        let currentEnabledTraits = self.resolutionTraits(for: identity)
+                        // If a decision has already been made for this package but a change in enabled traits
+                        // is detected, flag it so the resolver can repair the shape of the package graph below
+                        // it (if applicable due to trait-guarded dependencies).
+                        if !currentEnabledTraits.isSubset(of: previousDecisionEnabledTraits)
+                        {
+                            self.decisionsToRepair.formUnion(self.solution.decisions(for: identity))
+                        }
+                    }
                     if let incompats = self.incompatibilities[package] {
                         if !incompats.contains(incompatibility) {
                             self.incompatibilities[package]!.append(incompatibility)
@@ -77,6 +121,15 @@ public struct PubGrubDependencyResolver {
                 return all.filter {
                     $0.terms.first { $0.node == node }!.isPositive
                 }
+            }
+        }
+
+        /// Returns this package's true, unified enabled traits, as accumulated from every
+        /// incompatibility seen so far (i.e. as new levels in the package dependency graph are
+        /// discovered and loaded).
+        func enabledTraits(for node: DependencyResolutionNode) -> EnabledTraits {
+            self.lock.withLock {
+                self.resolutionTraits(for: node.package.identity)
             }
         }
 
@@ -512,9 +565,27 @@ public struct PubGrubDependencyResolver {
             // initiate prefetch of known packages that will be used to make the decision on the next step
             self.provider.prefetch(containers: state.solution.undecided.map(\.node.package))
 
-            // If decision making determines that no more decisions are to be
-            // made, it returns nil to signal that version solving is done.
-            next = try await self.makeDecision(state: state)
+            // Ensure that decisions that need repairing are prioritized.
+            if let repairNode = state.decisionsToRepair.popFirst(),
+               let version = state.solution.decisions[repairNode] {
+                next = repairNode
+                // Update incompatibilities for this node.
+                let container = try self.provider.getCachedContainer(for: repairNode.package)
+                let incompatibilities = try await container.incompatibilites(
+                    at: version,
+                    node: repairNode,
+                    overriddenPackages: state.overriddenPackages,
+                    root: state.root,
+                    enabledTraits: state.enabledTraits(for: repairNode)
+                )
+                for incompatibility in incompatibilities {
+                    state.addIncompatibility(incompatibility, at: .decisionMaking)
+                }
+            } else {
+                // If decision making determines that no more decisions are to be
+                // made, it returns nil to signal that version solving is done.
+                next = try await self.makeDecision(state: state)
+            }
         }
     }
 
@@ -754,7 +825,8 @@ public struct PubGrubDependencyResolver {
             at: version,
             node: pkgTerm.node,
             overriddenPackages: state.overriddenPackages,
-            root: state.root
+            root: state.root,
+            enabledTraits: state.enabledTraits(for: pkgTerm.node)
         )
 
         var haveConflict = false

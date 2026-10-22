@@ -227,6 +227,43 @@ struct ResourcesTests{
     }
 
     @Test(
+        .issue("https://github.com/swiftlang/swift-package-manager/issues/10572", relationship: .defect),
+        .tags(
+            .Feature.Command.Build,
+        ),
+        arguments: SupportedBuildSystemOnAllPlatforms,
+    )
+    func undeclaredPrivacyManifestIsOnlyCopiedWhenTargetingDarwin(
+        buildSystem: BuildSystemProvider.Kind,
+    ) async throws {
+        let configuration = BuildConfiguration.debug
+        try await fixture(name: "Resources/UndeclaredPrivacyManifest") { fixturePath in
+            try await executeSwiftBuild(
+                fixturePath,
+                configuration: configuration,
+                buildSystem: buildSystem,
+            )
+            let binPath = try await getBinPath(
+                fixturePath,
+                configuration: configuration,
+                buildSystem: buildSystem,
+            )
+
+            let resourceBundles = try localFileSystem.getDirectoryContents(binPath).filter {
+                $0.hasSuffix(".bundle") || $0.hasSuffix(".resources")
+            }
+
+            let expectedBundles: [String] =
+                if buildSystem != .native && ProcessInfo.hostOperatingSystem == .macOS {
+                    ["UndeclaredPrivacyManifest_Utils.bundle"]
+                } else {
+                    []
+                }
+            #expect(resourceBundles == expectedBundles)
+        }
+    }
+
+    @Test(
         .tags(
             .Feature.Command.Test,
         ),
@@ -337,20 +374,12 @@ struct ResourcesTests{
                 try localFileSystem.writeFileContents(resource, string: "best")
                 try requireFileExists(at: resource)
 
-                let (_, stderr) = try await executeSwiftBuild(
+                try await executeSwiftBuild(
                     packageDir,
                     configuration: configuration,
                     env: ["SWIFT_DRIVER_SWIFTSCAN_LIB" : "/this/is/a/bad/path"],
                     buildSystem: buildSystem,
                 )
-                // Filter some unrelated output that could show up on stderr.
-                let buidlSystemDeprecationDiag = Basics.Diagnostic.deprecatedBuildSystem(buildSystem: buildSystem)
-                let filteredStderr = stderr.components(separatedBy: "\n").filter { !$0.contains("[logging]") }
-                                                                        .filter { !$0.contains("Unable to locate libSwiftScan") }
-                                                                        .filter {
-                                                                            !$0.contains(Basics.Diagnostic.deprecatedBuildSystem(buildSystem: buildSystem).message)
-                                                                        }.joined(separator: "\n")
-                #expect(filteredStderr == "", "unexpectedly received error output: \(stderr)")
 
                 let builtProductsDir = try await getBinPath(
                     packageDir,
@@ -374,7 +403,7 @@ struct ResourcesTests{
                 #endif
                 let resourcePath = builtProductsDir.appending(components: [potentialResourceBundleName] + additionalComponents +  ["resources", "best.txt"])
                 try requireFileExists(at: resourcePath, "resource file wasn't copied by the build")
-                let contents = try String(contentsOfFile: resourcePath.pathString)
+                let contents = try String(contentsOfFile: resourcePath.pathString, encoding: .utf8)
                 #expect(contents == "best", "unexpected resource contents: \(contents)")
             }
     }

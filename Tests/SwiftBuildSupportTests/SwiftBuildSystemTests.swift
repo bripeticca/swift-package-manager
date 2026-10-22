@@ -9,6 +9,7 @@
 // See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
+import Foundation
 
 import Testing
 
@@ -30,6 +31,7 @@ import _InternalTestSupport
 func withInstantiatedSwiftBuildSystem(
     fromFixture fixtureName: String,
     buildParameters: BuildParameters? = nil,
+    createREPLProduct: Bool = false,
     logLevel: Basics.Diagnostic.Severity = .warning,
     do doIt: @escaping (SwiftBuildSupport.SwiftBuildSystem, SWBBuildService, SWBBuildServiceSession, TestingObservability, BuildParameters,) async throws -> (),
 ) async throws {
@@ -41,12 +43,20 @@ func withInstantiatedSwiftBuildSystem(
             let buildParameters = if let buildParameters {
                 buildParameters
             } else {
-                mockBuildParameters(destination: .host, toolchain: toolchain, buildSystemKind: .swiftbuild)
+                mockBuildParameters(
+                    destination: .host,
+                    buildPath: tmpDir.appending("build"),
+                    toolchain: toolchain,
+                    buildSystemKind: .swiftbuild,
+                )
             }
             let observabilitySystem: TestingObservability = ObservabilitySystem.makeForTesting()
+            var workspaceConfiguration = WorkspaceConfiguration.default
+            workspaceConfiguration.createREPLProduct = createREPLProduct
             let workspace = try Workspace(
                 fileSystem: fileSystem,
                 forRootPackage: fixturePath,
+                configuration: workspaceConfiguration,
                 customManifestLoader: ManifestLoader(toolchain: toolchain),
             )
             let rootInput = PackageGraphRootInput(packages: [fixturePath], dependencies: [])
@@ -142,6 +152,30 @@ extension PackageModel.Sanitizer {
 )
 struct SwiftBuildSystemTests {
 
+    @Test
+    func replIncludesGeneratedModuleMaps() async throws {
+        try await withInstantiatedSwiftBuildSystem(
+            fromFixture: "CFamilyTargets/ModuleMapGenerationCases",
+            createREPLProduct: true,
+        ) { swiftBuild, _, _, _, _ in
+            let result = try await swiftBuild.build(
+                subset: .allExcludingTests,
+                buildOutputs: [.replArguments],
+            )
+            let replArguments = try #require(result.replArguments)
+
+            #expect(replArguments.contains("-Xcc"))
+            #expect(!replArguments.contains("-fmodule-map-file="))
+            let moduleMapPathRegex = try! Regex(#"-fmodule-map-file=.*(/|\\)FlatInclude.modulemap"#)
+            #expect(
+                replArguments.contains {
+                    $0.contains(moduleMapPathRegex)
+                },
+                "replArguments does not contain expected arguments.  REPL arguments: \(replArguments)",
+            )
+        }
+    }
+
     @Suite(
         .tags(
             .FunctionalArea.Sanitizer,
@@ -203,6 +237,71 @@ struct SwiftBuildSystemTests {
                     )
                 }
             }
+        }
+    }
+
+    @Test
+    func userSwiftExecOverrideIsAlwaysHonoured() async throws {
+        let base = try UserToolchain.default
+        let overrideCompiler = base.swiftCompilerPath.parentDirectory.appending(executableName("swift"))
+        var environment = Environment.current
+        environment["SWIFT_EXEC"] = overrideCompiler.pathString
+        let overridden = try UserToolchain(swiftSDK: base.swiftSDK, environment: environment)
+        try #require(overridden.swiftCompilerPath == overrideCompiler)
+        try #require(overrideCompiler != base.swiftCompilerPath)
+
+        try await withInstantiatedSwiftBuildSystem(
+            fromFixture: "PIFBuilder/Simple",
+            buildParameters: mockBuildParameters(
+                destination: .host,
+                toolchain: overridden,
+                buildSystemKind: .swiftbuild,
+            ),
+        ) { swiftBuild, service, session, _, _ in
+            let buildSettings: SWBBuildParameters = try await swiftBuild.makeBuildParameters(
+                service: service,
+                session: session,
+                symbolGraphOptions: nil,
+                shouldDisableSandbox: false,
+            )
+
+            let synthesized = try #require(buildSettings.overrides.synthesized)
+            #expect(synthesized.table["SWIFT_EXEC"] == overrideCompiler.pathStringWithPosixSlashes)
+        }
+    }
+
+    @Test(
+        arguments: [
+            (architectures: ["arm64"], expected: "YES" as String?),
+            (architectures: ["arm64", "x86_64"], expected: "YES" as String?),
+            (architectures: [String](), expected: nil as String?),
+        ]
+    )
+    func moduleOnlyArchsDisabledWhenArchitecturesAreRequested(
+        architectures: [String],
+        expected: String?,
+    ) async throws {
+        var buildParameters = mockBuildParameters(
+            destination: .host,
+            toolchain: try UserToolchain.default,
+            buildSystemKind: .swiftbuild,
+        )
+        buildParameters.architectures = architectures.isEmpty ? nil : architectures
+
+        try await withInstantiatedSwiftBuildSystem(
+            fromFixture: "PIFBuilder/Simple",
+            buildParameters: buildParameters,
+        ) { swiftBuild, service, session, _, _ in
+            let buildSettings = try await swiftBuild.makeBuildParameters(
+                service: service,
+                session: session,
+                symbolGraphOptions: nil,
+                setToolchainSetting: false,
+                shouldDisableSandbox: false,
+            )
+
+            let synthesized = try #require(buildSettings.overrides.synthesized)
+            #expect(synthesized.table["SWIFT_DISABLE_MODULE_ONLY_ARCHS"] == expected)
         }
     }
 
@@ -841,6 +940,68 @@ struct SwiftBuildSystemTests {
 
             let runDestination = try #require(buildSettings.activeRunDestination)
             #expect(runDestination.sdk == sdkRoot.pathString)
+        }
+    }
+
+    @Suite
+    struct AdHocEntitlementsTests {
+        private static let getTaskAllowKey = "com.apple.security.get-task-allow"
+        private static let applicationIdentifierKeys = [
+            "com.apple.application-identifier",
+            "application-identifier",
+        ]
+
+        @Test
+        func macOSSignatureAppliesOnlyGetTaskAllow() throws {
+            let (signed, simulated) = SwiftBuildSystemPlanningOperationDelegate.adHocSignedEntitlements(
+                sdkRoot: "macosx.sdk",
+                entitlementsDestination: "Signature",
+                shouldEnableDebuggingEntitlement: true
+            )
+
+            #expect(signed == [Self.getTaskAllowKey: .plBool(true)])
+            #expect(simulated.isEmpty)
+            for key in Self.applicationIdentifierKeys {
+                #expect(signed[key] == nil, "ad-hoc signature must not inject \(key)")
+            }
+        }
+
+        @Test
+        func macOSWithoutDebuggingEntitlementSignsNothing() throws {
+            let (signed, simulated) = SwiftBuildSystemPlanningOperationDelegate.adHocSignedEntitlements(
+                sdkRoot: "macosx.sdk",
+                entitlementsDestination: "Signature",
+                shouldEnableDebuggingEntitlement: false
+            )
+
+            #expect(signed.isEmpty)
+            #expect(simulated.isEmpty)
+        }
+
+        @Test
+        func simulatorAppliesGetTaskAllowToSimulatedEntitlements() throws {
+            let (signed, simulated) = SwiftBuildSystemPlanningOperationDelegate.adHocSignedEntitlements(
+                sdkRoot: "iphonesimulator.sdk",
+                entitlementsDestination: "__entitlements",
+                shouldEnableDebuggingEntitlement: true
+            )
+
+            #expect(signed.isEmpty)
+            #expect(simulated == [Self.getTaskAllowKey: .plBool(true)])
+            for key in Self.applicationIdentifierKeys {
+                #expect(simulated[key] == nil, "ad-hoc simulated entitlements must not inject \(key)")
+            }
+        }
+
+        @Test
+        func nonDarwinUsesUnprefixedGetTaskAllowKey() throws {
+            let (signed, _) = SwiftBuildSystemPlanningOperationDelegate.adHocSignedEntitlements(
+                sdkRoot: "linux",
+                entitlementsDestination: "Signature",
+                shouldEnableDebuggingEntitlement: true
+            )
+
+            #expect(signed == ["get-task-allow": .plBool(true)])
         }
     }
 }

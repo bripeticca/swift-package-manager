@@ -31,15 +31,17 @@ extension PIFBuilderParameters {
         temporaryDirectory: Basics.AbsolutePath,
         addLocalRpaths: PackagePIFBuilder.AddLocalRpaths,
         shouldCreateDylibForDynamicProducts: Bool = false,
+        createDynamicVariantsForLibraryProducts: Bool = false,
         pluginScriptRunner: PluginScriptRunner? = nil,
-        hostBuildProductsPath: Basics.AbsolutePath? = nil
+        hostBuildProductsPath: Basics.AbsolutePath? = nil,
+        hostTriple: Basics.Triple? = nil
     ) throws -> Self {
         try self.init(
             isPackageAccessModifierSupported: true,
             enableTestability: false,
             shouldCreateDylibForDynamicProducts: shouldCreateDylibForDynamicProducts,
             materializeStaticArchiveProductsForRootPackages: true,
-            createDynamicVariantsForLibraryProducts: false,
+            createDynamicVariantsForLibraryProducts: createDynamicVariantsForLibraryProducts,
             toolchainLibDir: temporaryDirectory.appending(component: "toolchain-lib-dir"),
             pkgConfigDirectories: [],
             supportedSwiftVersions: [.v4, .v4_2, .v5, .v6],
@@ -52,7 +54,8 @@ extension PIFBuilderParameters {
             pluginWorkingDirectory: temporaryDirectory.appending(component: "plugin-working-dir"),
             additionalFileRules: [],
             addLocalRpaths: addLocalRpaths,
-            hostBuildProductsPath: hostBuildProductsPath ?? temporaryDirectory.appending(component: "host-build-products")
+            hostBuildProductsPath: hostBuildProductsPath ?? temporaryDirectory.appending(component: "host-build-products"),
+            hostTriple: try hostTriple ?? UserToolchain.default.targetTriple
         )
     }
 }
@@ -840,6 +843,255 @@ struct PIFBuilderTests {
         }
     }
 
+    @Test
+    func binaryFrameworkProductWithStubTargetSynthesizesDisambiguatedDynamicVariant() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(
+            emptyFiles: [
+                "/Widget/Sources/_WidgetStub/WidgetStub.swift",
+            ]
+        )
+        // A framework-style XCFramework whose embedded library is `Widget.framework`.
+        try fs.createDirectory("/Widget/Widget.xcframework", recursive: true)
+        try fs.writeFileContents(
+            "/Widget/Widget.xcframework/Info.plist",
+            string: """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>AvailableLibraries</key>
+                <array>
+                    <dict>
+                        <key>LibraryIdentifier</key>
+                        <string>macos-arm64</string>
+                        <key>LibraryPath</key>
+                        <string>Widget.framework</string>
+                        <key>SupportedArchitectures</key>
+                        <array>
+                            <string>arm64</string>
+                        </array>
+                        <key>SupportedPlatform</key>
+                        <string>macos</string>
+                    </dict>
+                </array>
+                <key>CFBundlePackageType</key>
+                <string>XFWK</string>
+                <key>XCFrameworkFormatVersion</key>
+                <string>1.0</string>
+            </dict>
+            </plist>
+            """
+        )
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Widget",
+                    path: "/Widget",
+                    toolsVersion: .v6_2,
+                    products: [
+                        .init(name: "Widget", type: .library(.automatic), targets: ["Widget", "_WidgetStub"]),
+                    ],
+                    targets: [
+                        .init(name: "Widget", path: "Widget.xcframework", type: .binary),
+                        .init(name: "_WidgetStub"),
+                    ]
+                )
+            ],
+            binaryArtifacts: [
+                .plain("widget"): [
+                    "Widget": .init(kind: .xcframework, originURL: nil, path: "/Widget/Widget.xcframework"),
+                ],
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root,
+                addLocalRpaths: .always,
+                shouldCreateDylibForDynamicProducts: false,
+                // Xcode enables this so it can vend dynamic frameworks to Previews / Playgrounds.
+                createDynamicVariantsForLibraryProducts: true
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let widgetProject = try pif.workspace.project(named: "Widget")
+
+        let dynamicVariantName = PackagePIFBuilder.targetName(forProductName: "Widget", suffix: .dynamic)
+        let dynamicVariant = try widgetProject.target(named: dynamicVariantName)
+
+        guard case .target(let dynamicTarget) = dynamicVariant else {
+            Issue.record("Expected a dynamic framework variant '\(dynamicVariantName)' to be synthesized")
+            return
+        }
+        #expect(dynamicTarget.productType == .framework)
+
+        for configuration in BuildConfiguration.allCases {
+            let productName = try dynamicVariant.buildConfig(named: configuration).settings[.PRODUCT_NAME]
+            #expect(
+                productName != "Widget",
+                "Dynamic framework variant must not be named 'Widget', which collides with the vended Widget.framework"
+            )
+        }
+    }
+
+    @Test
+    func libraryProductWithDifferentlyNamedBinaryFrameworkStillSynthesizesDynamicVariant() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(
+            emptyFiles: [
+                "/Media/Sources/MediaKit/MediaKit.swift",
+            ]
+        )
+        try fs.createDirectory("/Media/Codec.xcframework", recursive: true)
+        try fs.writeFileContents(
+            "/Media/Codec.xcframework/Info.plist",
+            string: """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>AvailableLibraries</key>
+                <array>
+                    <dict>
+                        <key>LibraryIdentifier</key>
+                        <string>macos-arm64</string>
+                        <key>LibraryPath</key>
+                        <string>Codec.framework</string>
+                        <key>SupportedArchitectures</key>
+                        <array>
+                            <string>arm64</string>
+                        </array>
+                        <key>SupportedPlatform</key>
+                        <string>macos</string>
+                    </dict>
+                </array>
+                <key>CFBundlePackageType</key>
+                <string>XFWK</string>
+                <key>XCFrameworkFormatVersion</key>
+                <string>1.0</string>
+            </dict>
+            </plist>
+            """
+        )
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Media",
+                    path: "/Media",
+                    toolsVersion: .v6_2,
+                    products: [
+                        .init(name: "Media", type: .library(.automatic), targets: ["MediaKit", "Codec"]),
+                    ],
+                    targets: [
+                        .init(name: "MediaKit"),
+                        .init(name: "Codec", path: "Codec.xcframework", type: .binary),
+                    ]
+                )
+            ],
+            binaryArtifacts: [
+                .plain("media"): [
+                    "Codec": .init(kind: .xcframework, originURL: nil, path: "/Media/Codec.xcframework"),
+                ],
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root,
+                addLocalRpaths: .always,
+                shouldCreateDylibForDynamicProducts: false,
+                createDynamicVariantsForLibraryProducts: true
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let mediaProject = try pif.workspace.project(named: "Media")
+
+        // The `Media.framework` dynamic variant cannot collide with the vended `Codec.framework`, so it
+        // should still be synthesized to support Previews/Playgrounds
+        let dynamicVariantName = PackagePIFBuilder.targetName(forProductName: "Media", suffix: .dynamic)
+        let dynamicVariant = mediaProject.underlying.targets.first { $0.common.name == dynamicVariantName }
+
+        guard case .target(let dynamicTarget) = dynamicVariant else {
+            Issue.record("Expected a dynamic framework variant '\(dynamicVariantName)' to be synthesized")
+            return
+        }
+        #expect(dynamicTarget.productType == .framework)
+        #expect(dynamicTarget.productName == "$(WRAPPER_NAME)")
+    }
+
+
+    @Test
+    func mainModuleProductMetadataUsesMainModuleName() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(
+            emptyFiles: [
+                "/MyPkg/Sources/MyAppModule/main.swift",
+            ]
+        )
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "MyPkg",
+                    path: "/MyPkg",
+                    toolsVersion: .v6_2,
+                    products: [
+                        .init(name: "my-exec", type: .executable, targets: ["exec"]),
+                    ],
+                    targets: [
+                        .init(name: "exec", type: .executable),
+                    ]
+                )
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root,
+                addLocalRpaths: .always
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (_, metadata) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let product = try #require(metadata.first { $0.name == "my-exec" })
+        #expect(product.moduleName == "exec")
+    }
+
     @Test(
         arguments: BuildConfiguration.allCases,
     )
@@ -909,6 +1161,159 @@ struct PIFBuilderTests {
                 )
             case .release:
                 #expect(ldflags == nil, "Release config should not have debug flags, but got \(ldflags)")
+            }
+        }
+    }
+
+    @Test(
+        .issue("https://github.com/swiftlang/swift-package-manager/issues/10225", relationship: .verifies),
+        arguments: BuildConfiguration.allCases
+    )
+    func testRunnerInheritsUnitTestLinkerFlags(configuration: BuildConfiguration) async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/Lib/Lib.swift",
+            "/Root/Tests/LibTests/LibTests.swift",
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v6_2,
+                    targets: [
+                        TargetDescription(name: "Lib"),
+                        TargetDescription(
+                            name: "LibTests",
+                            dependencies: ["Lib"],
+                            type: .test,
+                            settings: [
+                                .init(tool: .linker, kind: .unsafeFlags(["-L", "/Vendor"])),
+                                .init(tool: .linker, kind: .linkedLibrary("helper")),
+                            ]
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let project = try pif.workspace.project(named: "Root")
+
+        let runnerTarget = try #require(
+            project.underlying.targets.first {
+                guard case .target(let target) = $0 else { return false }
+                return target.productType == .swiftpmTestRunner
+            }
+        )
+
+        let ldFlags = try #require(try runnerTarget.buildConfig(named: configuration).settings[.OTHER_LDFLAGS])
+        #expect(ldFlags.contains("-lhelper"))
+        #expect(ldFlags.contains("-L") && ldFlags.contains("/Vendor"))
+    }
+
+    @Test(arguments: BuildConfiguration.allCases, [PackagePIFBuilder.AddLocalRpaths.always, .never])
+    func testProductsAddAppleBundleRpaths(
+        configuration: BuildConfiguration,
+        addLocalRpaths: PackagePIFBuilder.AddLocalRpaths
+    ) async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/Lib/Lib.swift",
+            "/Root/Tests/LibTests/LibTests.swift",
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v6_2,
+                    products: [
+                        ProductDescription(name: "Lib", type: .library(.automatic), targets: ["Lib"]),
+                    ],
+                    targets: [
+                        TargetDescription(name: "Lib", dependencies: []),
+                        TargetDescription(name: "LibTests", dependencies: ["Lib"], type: .test),
+                    ]
+                ),
+            ],
+            shouldCreateMultipleTestProducts: true,
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: addLocalRpaths
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let project = try pif.workspace.project(named: "Root")
+        let applePlatforms: [ProjectModel.BuildSettings.Platform] = [
+            .macOS, .macCatalyst, .driverKit, .iOS, .watchOS, .tvOS, .xrOS,
+        ]
+
+        let testSettings = try project.target(named: "LibTests-product")
+            .buildConfig(named: configuration)
+            .settings
+
+        if addLocalRpaths == .never {
+            #expect(testSettings[single: "APPLE_TEST_BUNDLE_RPATH"] == nil)
+            #expect(testSettings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_YES"] == nil)
+            #expect(testSettings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_NO"] == nil)
+            #expect(testSettings[.LD_RUNPATH_SEARCH_PATHS] == nil)
+            for platform in applePlatforms {
+                #expect(testSettings[.LD_RUNPATH_SEARCH_PATHS, platform] == nil)
+            }
+        } else {
+            #expect(
+                testSettings[single: "APPLE_TEST_BUNDLE_RPATH"]
+                    == "$(APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_$(SHALLOW_BUNDLE:default=NO))"
+            )
+            #expect(testSettings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_YES"] == "@loader_path/../..")
+            #expect(testSettings[single: "APPLE_TEST_BUNDLE_RPATH_SHALLOW_BUNDLE_NO"] == "@loader_path/../../..")
+
+            #expect(testSettings[.LD_RUNPATH_SEARCH_PATHS] == [
+                "$(RPATH_ORIGIN)/Frameworks",
+                "$(RPATH_ORIGIN)/../Frameworks",
+                "$(inherited)",
+            ])
+
+            for platform in applePlatforms {
+                #expect(testSettings[.LD_RUNPATH_SEARCH_PATHS, platform] == ["$(APPLE_TEST_BUNDLE_RPATH)", "$(inherited)"])
+            }
+
+            for platform in [ProjectModel.BuildSettings.Platform.linux, .windows, .android, .wasi] {
+                #expect(testSettings[.LD_RUNPATH_SEARCH_PATHS, platform] == nil, "\(platform)")
             }
         }
     }
@@ -1395,6 +1800,96 @@ struct PIFBuilderTests {
         }
     }
 
+    @Test func swiftCompileForStaticLinkingInPromotableAutomaticLibraries() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/ModuleA/ModuleA.swift",
+            "/Root/Sources/ModuleB/ModuleB.swift",
+            "/Root/Sources/ModuleC/ModuleC.swift",
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v6_0,
+                    products: [
+                        ProductDescription(name: "AutomaticLib", type: .library(.automatic), targets: ["ModuleA", "ModuleB"]),
+                        ProductDescription(name: "StaticLib", type: .library(.static), targets: ["ModuleC"]),
+                    ],
+                    targets: [
+                        TargetDescription(name: "ModuleA"),
+                        TargetDescription(name: "ModuleB"),
+                        TargetDescription(name: "ModuleC"),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                createDynamicVariantsForLibraryProducts: true
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+
+        let project = try pif.workspace.project(named: "Root")
+
+        let automaticLibTarget = try project.target(named: "AutomaticLib-product")
+        guard case .target(let automaticLibStandardTarget) = automaticLibTarget else {
+            Issue.record("Expected 'AutomaticLib-product' to be a standard target")
+            return
+        }
+        #expect(automaticLibStandardTarget.dynamicTargetVariantId != nil)
+
+        for moduleName in ["ModuleA", "ModuleB"] {
+            let moduleTarget = try project.target(named: moduleName)
+            let config = try moduleTarget.buildConfig(named: .release)
+
+            #expect(
+                config.settings[
+                    .SWIFT_DISABLE_COMPILATION_FOR_STATIC_LINKING_WHEN_ANY_TARGET_IS_PROMOTED_TO_DYNAMIC,
+                    .windows
+                ] == [automaticLibTarget.id.value]
+            )
+            #expect(
+                config.settings[.SWIFT_COMPILE_FOR_STATIC_LINKING, .windows] == nil,
+                "Module \(moduleName) should not disable static linking mode unconditionally"
+            )
+
+            for platform in SwiftBuild.ProjectModel.BuildSettings.Platform.allCases where platform != .windows {
+                #expect(
+                    config.settings[
+                        .SWIFT_DISABLE_COMPILATION_FOR_STATIC_LINKING_WHEN_ANY_TARGET_IS_PROMOTED_TO_DYNAMIC,
+                        platform
+                    ] == nil
+                )
+            }
+        }
+
+        let moduleCConfig = try project.target(named: "ModuleC").buildConfig(named: .release)
+        for platform in ProjectModel.BuildSettings.Platform.allCases {
+            #expect(
+                moduleCConfig.settings[
+                    .SWIFT_DISABLE_COMPILATION_FOR_STATIC_LINKING_WHEN_ANY_TARGET_IS_PROMOTED_TO_DYNAMIC,
+                    platform
+                ] == nil
+            )
+        }
+    }
+
     @Test func macroPackageSupportedPlatforms() async throws {
         try await withGeneratedPIF(fromFixture: "Macros/MinimalMacroPackage") { pif, observabilitySystem, fixturePath in
             #expect(observabilitySystem.diagnostics.filter { $0.severity == .error }.isEmpty)
@@ -1415,7 +1910,7 @@ struct PIFBuilderTests {
         }
     }
 
-    @Test func macroPackageTestDependencies() async throws {
+    @Test func testTargetWithTransitiveMacroImplementationDependency() async throws {
         try await withGeneratedPIF(fromFixture: "Macros/MinimalMacroPackage") { pif, observabilitySystem, _ in
             #expect(observabilitySystem.diagnostics.filter { $0.severity == .error }.isEmpty)
 
@@ -1430,15 +1925,34 @@ struct PIFBuilderTests {
 
             let depIDs = testTarget.common.dependencies.map(\.targetId.value)
 
-            // The test bundle should link both the testable variant of the macro target, and its transitive dependency.
-            #expect(
-                depIDs.contains { $0.hasPrefix("PACKAGE-TARGET:MacroImpl-") && $0.hasSuffix("-testable") },
-                "Expected test bundle to link testable variant of MacroImpl, found dependencies: \(depIDs)"
-            )
-            #expect(
-                depIDs.contains("PACKAGE-TARGET:MacroImplHelpers"),
-                "Expected test bundle to link MacroImplHelpers, found dependencies: \(depIDs)"
-            )
+            // The macro implementation is a transitive dependency of the tests. The PIF should represent this
+            // dependency, but it should not be a linkage dependency, and the macro helpers also should not be
+            // linked.
+            #expect(depIDs.contains("PACKAGE-TARGET:MacroImpl"))
+            #expect(!depIDs.contains { $0.hasPrefix("PACKAGE-TARGET:MacroImpl-") && $0.hasSuffix("-testable") })
+            #expect(!depIDs.contains("PACKAGE-TARGET:MacroImplHelpers"))
+        }
+    }
+
+    @Test func testTargetWithDirectMacroImplementationDependency() async throws {
+        try await withGeneratedPIF(fromFixture: "Macros/MacroWithDirectTestDependency") { pif, observabilitySystem, _ in
+            #expect(observabilitySystem.diagnostics.filter { $0.severity == .error }.isEmpty)
+
+            let project = try pif.workspace.project(named: "MacroWithDirectTestDependency")
+
+            let testProduct = try project.target(named: "MacroImplTests-product")
+            guard case .target(let testTarget) = testProduct else {
+                Issue.record("Expected MacroImplTests-product to be a regular target")
+                return
+            }
+            #expect(testTarget.productType == .unitTest)
+
+            let depIDs = testTarget.common.dependencies.map(\.targetId.value)
+
+            // The macro implementation is a direct dependency of the test target. Ensure the testable variant and
+            // the helpers are linkage dependencies.
+            #expect(depIDs.contains { $0.hasPrefix("PACKAGE-TARGET:MacroImpl-") && $0.hasSuffix("-testable") })
+            #expect(depIDs.contains("PACKAGE-TARGET:MacroImplHelpers"))
         }
     }
 
@@ -1714,6 +2228,427 @@ struct PIFBuilderTests {
         )
     }
 
+    @Test func hostBuildToolExcludedFromAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "PluginTool", type: .executable),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+        }
+    }
+
+    @Test func hostBuildToolDependencyExcludedFromAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+            "/Root/Sources/Dep/dep.swift"
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "PluginTool", dependencies: ["Dep"], type: .executable),
+                        TargetDescription(name: "Dep"),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let depModuleID = try rootProject.target(named: "Dep").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+            // Dep is only a dependency of a host tool, so it should not be included in the aggregate
+            #expect(!deps.contains(depModuleID))
+        }
+    }
+
+    @Test func standaloneTargetIncludedInAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/OtherLib/OtherLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+            "/Root/Sources/Dep/dep.swift"
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "OtherLib"),
+                        TargetDescription(name: "PluginTool", dependencies: ["Dep"], type: .executable),
+                        TargetDescription(name: "Dep"),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let otherLibID = try rootProject.target(named: "OtherLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let depModuleID = try rootProject.target(named: "Dep").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(deps.contains(otherLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+            #expect(!deps.contains(depModuleID))
+        }
+    }
+
+    @Test func sharedHostBuildToolAndDestinationDependencyIncludedInAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+            "/Root/Sources/Dep/dep.swift"
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            dependencies: ["Dep"],
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "PluginTool", dependencies: ["Dep"], type: .executable),
+                        TargetDescription(name: "Dep"),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let depModuleID = try rootProject.target(named: "Dep").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+            // Dep is depended upon by host and non-host targets, so it should be included in the aggregate.
+            #expect(deps.contains(depModuleID))
+        }
+    }
+
+    @Test func hostBuildToolDependencyIncludedInProductIncludedInAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+            "/Root/Sources/Dep/dep.swift"
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    products: [
+                        ProductDescription(name: "MyProduct", type: .library(.automatic), targets: ["Dep"])
+                    ],
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "PluginTool", dependencies: ["Dep"], type: .executable),
+                        TargetDescription(name: "Dep"),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let depModuleID = try rootProject.target(named: "Dep").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+            // Dep is part of a product, so it should be included in the aggregate.
+            #expect(deps.contains(depModuleID))
+        }
+    }
+
+    @Test func hostBuildToolDependencyUsedByTestTargetIncludedInAggregates() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/RootLib/RootLib.swift",
+            "/Root/Sources/PluginTool/main.swift",
+            "/Root/Plugins/MyPlugin/plugin.swift",
+            "/Root/Sources/Dep/dep.swift",
+            "/Root/Tests/DepTests/DepTests.swift"
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                Manifest.createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v5_9,
+                    targets: [
+                        TargetDescription(
+                            name: "RootLib",
+                            pluginUsages: [.plugin(name: "MyPlugin", package: nil)]
+                        ),
+                        TargetDescription(name: "PluginTool", dependencies: ["Dep"], type: .executable),
+                        TargetDescription(name: "Dep"),
+                        TargetDescription(
+                            name: "MyPlugin",
+                            dependencies: ["PluginTool"],
+                            type: .plugin,
+                            pluginCapability: .buildTool
+                        ),
+                        TargetDescription(name: "DepTests", dependencies: ["Dep"], type: .test),
+                    ]
+                ),
+            ],
+            shouldCreateMultipleTestProducts: true,
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always,
+                pluginScriptRunner: NoOpPluginScriptRunner()
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild, triple: .wasi)
+        )
+
+        let errors = observability.diagnostics.filter { $0.severity == .error }
+        #expect(errors.isEmpty, "Expected no errors during PIF generation, but got: \(errors)")
+
+        let rootProject = try pif.workspace.project(named: "Root")
+        let rootLibID = try rootProject.target(named: "RootLib").common.id.value
+        let toolModuleID = try rootProject.target(named: "PluginTool").common.id.value
+        let depModuleID = try rootProject.target(named: "Dep").common.id.value
+        let toolProductID = try rootProject.target(named: "PluginTool-product").common.id.value
+
+        let aggregate = try pif.workspace.project(named: "Aggregate")
+        for aggregateName in [PIFBuilder.allExcludingTestsTargetName, PIFBuilder.allIncludingTestsTargetName] {
+            let deps = Set(try aggregate.target(named: aggregateName).common.dependencies.map(\.targetId.value))
+            #expect(deps.contains(rootLibID))
+            #expect(!deps.contains(toolModuleID))
+            #expect(!deps.contains(toolProductID))
+            // Dep is a dependency of a host tool, and the tests, so it should not be included in the aggregate.
+            // It will still be specialized for the destination when building tests because the test target is
+            // part of the tests aggregate.
+            #expect(!deps.contains(depModuleID))
+        }
+    }
+
     /// Tests the cross-package case: the build tool plugin lives in one package and its
     /// executable tool lives in a separate package. The plugin declares the dependency via
     /// `.product(name:package:)`, which routes through a different code path than the
@@ -1806,6 +2741,184 @@ struct PIFBuilderTests {
             "Expected MyPlugin to depend on my-tool-product from ToolPkg. Actual dependencies: \(pluginTarget.common.dependencies.map(\.targetId.value))"
         )
     }
+
+    @Test(
+        .issue("https://github.com/swiftlang/swift-package-manager/issues/9516", relationship: .verifies)
+    )
+    func transitiveLinkageDependencyThroughPlatformFilter() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/Library/Library.swift",
+            "/Root/Sources/AndroidSupport/AndroidSupport.swift",
+            "/Root/Sources/AndroidOnlyHelper/AndroidOnlyHelper.swift",
+            "/Root/Sources/Shared/Shared.swift",
+        ])
+
+        let androidOnly = PackageConditionDescription(platformNames: ["android"])
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v6_2,
+                    targets: [
+                        TargetDescription(
+                            name: "Library",
+                            dependencies: [
+                                .target(name: "AndroidSupport", condition: androidOnly),
+                                .target(name: "Shared", condition: nil),
+                            ]
+                        ),
+                        TargetDescription(
+                            name: "AndroidSupport",
+                            dependencies: [
+                                .target(name: "AndroidOnlyHelper", condition: nil),
+                                .target(name: "Shared", condition: nil),
+                            ]
+                        ),
+                        TargetDescription(name: "AndroidOnlyHelper"),
+                        TargetDescription(name: "Shared"),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let project = try pif.workspace.project(named: "Root")
+        let library = try project.target(named: "Library")
+
+        let androidSupportEdge = try #require(library.common.dependencies.first { $0.targetId.value.hasSuffix("AndroidSupport") })
+        let helperEdge = try #require(
+            library.common.dependencies.first { $0.targetId.value.hasSuffix("AndroidOnlyHelper") }
+        )
+
+        #expect(!androidSupportEdge.platformFilters.isEmpty)
+        #expect(helperEdge.platformFilters == androidSupportEdge.platformFilters)
+
+        let androidSupport = try project.target(named: "AndroidSupport")
+        let directHelperEdge = try #require(androidSupport.common.dependencies.first { $0.targetId.value.hasSuffix("AndroidOnlyHelper") })
+        #expect(directHelperEdge.platformFilters.isEmpty)
+        let sharedEdge = try #require(library.common.dependencies.first { $0.targetId.value.hasSuffix("Shared") })
+        #expect(sharedEdge.platformFilters.isEmpty)
+    }
+
+    @Test
+    func transitiveLinkageDependencyThroughMultiplePlatformFilters() async throws {
+        let observability = ObservabilitySystem.makeForTesting()
+
+        let fs = InMemoryFileSystem(emptyFiles: [
+            "/Root/Sources/Library/Library.swift",
+            "/Root/Sources/MidA/MidA.swift",
+            "/Root/Sources/MidB/MidB.swift",
+            "/Root/Sources/MidC/MidC.swift",
+            "/Root/Sources/Deep/Deep.swift",
+            "/Root/Sources/DeadEnd/DeadEnd.swift",
+        ])
+
+        let graph = try loadModulesGraph(
+            fileSystem: fs,
+            manifests: [
+                .createRootManifest(
+                    displayName: "Root",
+                    path: "/Root",
+                    toolsVersion: .v6_2,
+                    targets: [
+                        TargetDescription(
+                            name: "Library",
+                            dependencies: [
+                                .target(name: "MidA", condition: PackageConditionDescription(platformNames: ["ios", "tvos"])),
+                                .target(name: "MidB", condition: PackageConditionDescription(platformNames: ["macos", "visionos"])),
+                                .target(name: "MidC", condition: PackageConditionDescription(platformNames: ["ios"])),
+                            ]
+                        ),
+                        TargetDescription(
+                            name: "MidA",
+                            dependencies: [.target(name: "Deep", condition: PackageConditionDescription(platformNames: ["tvos", "watchos"]))]
+                        ),
+                        TargetDescription(
+                            name: "MidB",
+                            dependencies: [.target(name: "Deep", condition: PackageConditionDescription(platformNames: ["macos", "watchos"]))]
+                        ),
+                        TargetDescription(
+                            name: "MidC",
+                            dependencies: [.target(name: "DeadEnd", condition: PackageConditionDescription(platformNames: ["watchos"]))]
+                        ),
+                        TargetDescription(name: "Deep"),
+                        TargetDescription(name: "DeadEnd"),
+                    ]
+                ),
+            ],
+            observabilityScope: observability.topScope
+        )
+
+        let pifBuilder = PIFBuilder(
+            graph: graph,
+            parameters: try PIFBuilderParameters.constructDefaultParametersForTesting(
+                temporaryDirectory: AbsolutePath.root.appending("tmp"),
+                addLocalRpaths: .always
+            ),
+            fileSystem: fs,
+            observabilityScope: observability.topScope
+        )
+        let (pif, _) = try await pifBuilder.constructPIF(
+            buildParameters: mockBuildParameters(destination: .host, buildSystemKind: .swiftbuild)
+        )
+        #expect(!observability.hasErrorDiagnostics)
+
+        let project = try pif.workspace.project(named: "Root")
+
+        func filters(from targetName: String, to suffix: String) throws -> Set<ProjectModel.PlatformFilter> {
+            let dependencies = try project.target(named: targetName).common.dependencies
+            let edge = try #require(dependencies.only { $0.targetId.value.hasSuffix(suffix) })
+            return edge.platformFilters
+        }
+
+        #expect(try filters(from: "Library", to: "MidA") == [
+            .init(platform: "ios"), .init(platform: "ios", environment: "simulator"),
+            .init(platform: "tvos"), .init(platform: "tvos", environment: "simulator"),
+        ])
+        #expect(try filters(from: "Library", to: "MidB") == [
+            .init(platform: "macos"),
+            .init(platform: "xros"), .init(platform: "xros", environment: "simulator"),
+        ])
+        #expect(try filters(from: "Library", to: "MidC") == [
+            .init(platform: "ios"), .init(platform: "ios", environment: "simulator"),
+        ])
+        #expect(try filters(from: "MidA", to: "Deep") == [
+            .init(platform: "tvos"), .init(platform: "tvos", environment: "simulator"),
+            .init(platform: "watchos"), .init(platform: "watchos", environment: "simulator"),
+        ])
+        #expect(try filters(from: "MidB", to: "Deep") == [
+            .init(platform: "macos"),
+            .init(platform: "watchos"), .init(platform: "watchos", environment: "simulator"),
+        ])
+        #expect(try filters(from: "MidC", to: "DeadEnd") == [
+            .init(platform: "watchos"), .init(platform: "watchos", environment: "simulator"),
+        ])
+
+        #expect(try filters(from: "Library", to: "Deep") == [
+            .init(platform: "macos"),
+            .init(platform: "tvos"), .init(platform: "tvos", environment: "simulator"),
+        ])
+        let library = try project.target(named: "Library")
+        #expect(!library.common.dependencies.contains { $0.targetId.value.hasSuffix("DeadEnd") })
+    }
 }
 
 /// A no-op plugin script runner for use in PIF builder tests that need a plugin in the graph
@@ -1880,5 +2993,220 @@ extension ProjectModel.Group {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Promoted Executable Product Tests
+
+/// A `PackagePIFBuilder.BuildDelegate` that lets a test control `customProductType(forExecutable:)`
+/// while returning the same defaults as the production delegate for everything else.
+private final class PromotingBuildDelegate: PackagePIFBuilder.BuildDelegate {
+    let package: ResolvedPackage
+    let promotedProductType: ProjectModel.Target.ProductType?
+
+    init(package: ResolvedPackage, promotedProductType: ProjectModel.Target.ProductType?) {
+        self.package = package
+        self.promotedProductType = promotedProductType
+    }
+
+    var isRootPackage: Bool { self.package.manifest.packageKind.isRoot }
+    var isRemote: Bool { self.package.manifest.packageKind.isRemote }
+    var hostsOnlyPackages: Bool { false }
+    var isUserManaged: Bool { true }
+    var isBranchOrRevisionBased: Bool { false }
+    var isPluginExecutionSandboxingDisabled: Bool { false }
+
+    func customProductType(forExecutable product: PackageModel.Product) -> ProjectModel.Target.ProductType? {
+        self.promotedProductType
+    }
+
+    func deviceFamilyIDs() -> Set<Int> { [] }
+    func shouldPackagesBuildForARM64e(platform: PackageModel.Platform) -> Bool { false }
+    func configureProjectBuildSettings(_ buildSettings: inout ProjectModel.BuildSettings) {}
+    func configureSourceModuleBuildSettings(sourceModule: ResolvedModule, settings: inout ProjectModel.BuildSettings) {}
+    func customInstallPath(product: PackageModel.Product) -> String? { nil }
+    func customProductName(forFramework product: PackageModel.Product) -> String? { nil }
+    func customBundleIdentifierPrefix(forFramework product: PackageModel.Product) -> String? { nil }
+    func customLibraryType(product: PackageModel.Product) -> PackageModel.ProductType.LibraryType? { nil }
+    func customSDKOptions(forPlatform: PackageModel.Platform) -> [String] { [] }
+
+    func addCustomTargets(pifProject: inout ProjectModel.Project) throws -> [PackagePIFBuilder.ModuleOrProduct] { [] }
+
+    func shouldSuppressProductDependency(
+        product: PackageModel.Product,
+        buildSettings: inout ProjectModel.BuildSettings
+    ) -> Bool { false }
+
+    func shouldSetInstallPathForDynamicLib(productName: String) -> Bool { false }
+
+    func configureLibraryProduct(
+        product: PackageModel.Product,
+        project: inout ProjectModel.Project,
+        target: WritableKeyPath<ProjectModel.Project, ProjectModel.Target>,
+        additionalFiles: WritableKeyPath<ProjectModel.Group, ProjectModel.Group>
+    ) {}
+
+    func suggestAlignedPlatformVersionGiveniOSVersion(
+        platform: PackageModel.Platform,
+        iOSVersion: PackageModel.PlatformVersion
+    ) -> String? { nil }
+
+    func validateMacroFingerprint(for macroModule: ResolvedModule) -> Bool { true }
+}
+
+/// Builds the PIF project for a package that has an executable product (module `AppModule`) and a unit
+/// test target that depends on it, promoting the executable to `promotedProductType` via the delegate.
+private func buildAppProject(
+    promotedProductType: ProjectModel.Target.ProductType?
+) async throws -> ProjectModel.Project {
+    let observability = ObservabilitySystem.makeForTesting()
+
+    let fs = InMemoryFileSystem(emptyFiles: [
+        "/App/Sources/AppModule/main.swift",
+        "/App/Tests/AppTests/AppTests.swift",
+    ])
+
+    let graph = try loadModulesGraph(
+        fileSystem: fs,
+        manifests: [
+            Manifest.createRootManifest(
+                displayName: "App",
+                path: "/App",
+                toolsVersion: .v5_9,
+                products: [
+                    ProductDescription(name: "App", type: .executable, targets: ["AppModule"]),
+                ],
+                targets: [
+                    TargetDescription(name: "AppModule", type: .executable),
+                    TargetDescription(name: "AppTests", dependencies: ["AppModule"], type: .test),
+                ]
+            ),
+        ],
+        observabilityScope: observability.topScope
+    )
+
+    let rootPackage = try #require(graph.rootPackages.first)
+
+    let delegate = PromotingBuildDelegate(package: rootPackage, promotedProductType: promotedProductType)
+    let builder = PackagePIFBuilder(
+        modulesGraph: graph,
+        resolvedPackage: rootPackage,
+        packageManifest: rootPackage.manifest,
+        delegate: delegate,
+        buildToolPluginResultsByTargetName: [String: [PackagePIFBuilder.BuildToolPluginInvocationResult]](),
+        packageDisplayVersion: rootPackage.manifest.displayName,
+        pkgConfigDirectories: [],
+        fileSystem: fs,
+        observabilityScope: observability.topScope
+    )
+    _ = try builder.build()
+
+    #expect(!observability.hasErrorDiagnostics, "Unexpected errors: \(observability.errors)")
+
+    // Keep the delegate alive for the duration of the build (`PackagePIFBuilder` holds it `unowned`).
+    withExtendedLifetime(delegate) {}
+
+    return builder.pifProject
+}
+
+extension ProjectModel.Project {
+    /// The main-module product target for a product, e.g. `App-product`.
+    fileprivate func productTarget(named name: String) throws -> ProjectModel.Target {
+        try self.onlyTarget {
+            guard case .target(let t) = $0 else { return false }
+            return t.common.name == name
+        }
+    }
+
+    /// The testable variant target for an executable module, e.g. `PACKAGE-TARGET:AppModule-<hash>-testable`.
+    fileprivate func testableVariantTarget(forModule moduleName: String) throws -> ProjectModel.Target {
+        try self.onlyTarget {
+            guard case .target(let t) = $0 else { return false }
+            return t.id.value.hasPrefix("PACKAGE-TARGET:\(moduleName)") && t.id.value.hasSuffix("-testable")
+        }
+    }
+
+    private func onlyTarget(where predicate: (ProjectModel.BaseTarget) -> Bool) throws -> ProjectModel.Target {
+        let matches = self.targets.filter(predicate)
+        guard let match = matches.only, case .target(let target) = match else {
+            throw StringError("Expected exactly one matching target, found \(matches.count)")
+        }
+        return target
+    }
+}
+
+extension ProjectModel.Target {
+    fileprivate func debugSettings() throws -> ProjectModel.BuildSettings {
+        guard let config = self.common.buildConfigs.first(where: { $0.name == "Debug" }) else {
+            throw StringError("No Debug build config in target \(self.id.value)")
+        }
+        return config.settings
+    }
+}
+
+@Suite(
+    .tags(
+        .TestSize.medium,
+        .FunctionalArea.PIF
+    )
+)
+struct PromotedExecutableProductPIFTests {
+    @Test
+    func promotedAppProductInstallsItsOwnSwiftModule() async throws {
+        // When an executable product is promoted to a non-executable PIF product (e.g. a mac catalyst app),
+        // the product target must install its own Swift module so downstream tooling (Previews)
+        // can find `<module>.swiftmodule`. A genuine executable product suppresses module installation to avoid
+        // conflicting with its testable variant.
+
+        // Promoted to an application: the product installs its module (setting is left unset).
+        let promotedProject = try await buildAppProject(promotedProductType: .application)
+        let promotedProductSettings = try promotedProject.productTarget(named: "App-product").debugSettings()
+        #expect(
+            promotedProductSettings[.SWIFT_INSTALL_MODULE] != "NO",
+            "A promoted (non-executable) product must install its own Swift module"
+        )
+
+        // A genuine executable product does not install its module — the testable variant does.
+        let executableProject = try await buildAppProject(promotedProductType: nil)
+        let executableProductSettings = try executableProject.productTarget(named: "App-product").debugSettings()
+        #expect(
+            executableProductSettings[.SWIFT_INSTALL_MODULE] == "NO",
+            "A genuine executable product must not install its Swift module"
+        )
+    }
+
+    @Test
+    func promotedAppWithUnitTestsInstallsModuleExactlyOnce() async throws {
+        // When a promoted app also has unit tests, the executable gains a testable variant that would install a
+        // module of the same name to the same location as the product target — producing a "Multiple commands
+        // produce <module>.swiftmodule" build error. The testable variant's module installation must be suppressed
+        // so exactly one target installs the module.
+        let project = try await buildAppProject(promotedProductType: .application)
+
+        let productSettings = try project.productTarget(named: "App-product").debugSettings()
+        let testableVariantSettings = try project.testableVariantTarget(forModule: "AppModule").debugSettings()
+
+        // The product installs the module; the testable variant is suppressed. Exactly one installer, no collision.
+        #expect(
+            productSettings[.SWIFT_INSTALL_MODULE] != "NO",
+            "The promoted product target must remain the sole module installer"
+        )
+        #expect(
+            testableVariantSettings[.SWIFT_INSTALL_MODULE] == "NO",
+            "The testable variant must suppress module installation when the product installs its own"
+        )
+    }
+
+    @Test
+    func genuineExecutableTestableVariantStillInstallsModule() async throws {
+        // A genuine executable's testable variant keeps installing its module. Multiple executable products can
+        // share one executable target, so the per-target testable variant remains the installer. This guards against
+        // over-suppressing the fix above.
+        let project = try await buildAppProject(promotedProductType: nil)
+        let testableVariantSettings = try project.testableVariantTarget(forModule: "AppModule").debugSettings()
+        #expect(
+            testableVariantSettings[.SWIFT_INSTALL_MODULE] != "NO",
+            "A genuine executable's testable variant must still install its Swift module"
+        )
     }
 }

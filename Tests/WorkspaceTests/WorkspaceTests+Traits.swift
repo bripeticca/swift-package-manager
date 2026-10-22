@@ -14,6 +14,7 @@ import _InternalTestSupport
 import Basics
 import PackageModel
 import XCTest
+import Testing
 
 extension WorkspaceTests {
     func testTraitConfigurationExists_NoDefaultTraits() async throws {
@@ -1598,5 +1599,1181 @@ extension WorkspaceTests {
             result.check(dependency: "guardedpackage", at: .checkout(.version("1.1.0")))
         }
     }
-}
 
+    func testUpdateWithRootDependencyGuardedByDefaultTrait() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(
+                                    name: "GuardedProduct",
+                                    package: "GuardedPackage",
+                                    condition: .init(traits: ["EnabledByDefault"])
+                                )
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./GuardedPackage", requirement: .upToNextMajor(from: "1.0.0"))
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "GuardedPackage",
+                    targets: [MockTarget(name: "GuardedTarget")],
+                    products: [MockProduct(name: "GuardedProduct", modules: ["GuardedTarget"])],
+                    versions: ["1.0.0", "1.1.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(roots: "Root")
+                result.check(packages: "Root", "GuardedPackage")
+            }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+
+        try await workspace.checkUpdate(roots: ["Root"]) { diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+
+        await workspace.checkManagedDependencies { result in
+            result.check(dependency: "guardedpackage", at: .checkout(.version("1.1.0")))
+        }
+    }
+
+    /// Console reaches Middle and Leaf with defaults before Proposal, one level deeper, enables the
+    /// Middle trait that conditionally enables a Leaf trait. The first graph load must include it.
+    func testConditionalTraitReachesPackageAlreadyLoadedWithDefaults() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "ServerProduct", package: "Server"),
+                                .product(name: "ConsoleLoggerProduct", package: "Console"),
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Server", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./Console", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "Server",
+                    targets: [
+                        MockTarget(
+                            name: "ServerTarget",
+                            dependencies: [.product(name: "ProposalProduct", package: "Proposal")]
+                        )
+                    ],
+                    products: [MockProduct(name: "ServerProduct", modules: ["ServerTarget"])],
+                    dependencies: [
+                        .sourceControl(path: "./Proposal", requirement: .upToNextMajor(from: "1.0.0"))
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Proposal",
+                    targets: [
+                        MockTarget(
+                            name: "ProposalTarget",
+                            dependencies: [.product(name: "MiddleProduct", package: "Middle")]
+                        )
+                    ],
+                    products: [MockProduct(name: "ProposalProduct", modules: ["ProposalTarget"])],
+                    dependencies: [
+                        .sourceControl(
+                            path: "./Middle",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: ["MiddleTrait"]
+                        )
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Console",
+                    targets: [
+                        MockTarget(
+                            name: "ConsoleKitTarget",
+                            dependencies: [.product(name: "MiddleProduct", package: "Middle")]
+                        ),
+                        MockTarget(
+                            name: "ConsoleLoggerTarget",
+                            dependencies: [.product(name: "LeafProduct", package: "Leaf")]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "ConsoleKitProduct", modules: ["ConsoleKitTarget"]),
+                        MockProduct(name: "ConsoleLoggerProduct", modules: ["ConsoleLoggerTarget"]),
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Middle", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./Leaf", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Middle",
+                    targets: [
+                        MockTarget(
+                            name: "MiddleTarget",
+                            dependencies: [.product(name: "LeafProduct", package: "Leaf")]
+                        )
+                    ],
+                    products: [MockProduct(name: "MiddleProduct", modules: ["MiddleTarget"])],
+                    dependencies: [
+                        .sourceControl(
+                            path: "./Leaf",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: [.init(name: "LeafTrait", condition: .init(traits: ["MiddleTrait"]))]
+                        )
+                    ],
+                    traits: [.init(name: "default", enabledTraits: []), "MiddleTrait"],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Leaf",
+                    targets: [MockTarget(name: "LeafTarget")],
+                    products: [MockProduct(name: "LeafProduct", modules: ["LeafTarget"])],
+                    traits: [.init(name: "default", enabledTraits: []), "LeafTrait"],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(packages: "Root", "Server", "Proposal", "Console", "Middle", "Leaf")
+                result.checkPackage("Middle") { package in
+                    XCTAssertEqual(package.enabledTraits?.sorted(), ["MiddleTrait"])
+                }
+                result.checkPackage("Leaf") { package in
+                    XCTAssertEqual(package.enabledTraits?.sorted(), ["LeafTrait"])
+                }
+            }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+    }
+
+    /// One parent asks for the shared package's defaults while another names a trait, so both
+    /// requests have to survive regardless of which parent registers first.
+    func testSharedDependencyExpandsTraitsRegisteredAfterItLoads() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "ParentAProduct", package: "ParentA"),
+                                .product(name: "ParentBProduct", package: "ParentB"),
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./ParentA", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./ParentB", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "ParentA",
+                    targets: [
+                        MockTarget(
+                            name: "ParentATarget",
+                            dependencies: [.product(name: "SharedProduct", package: "Shared")]
+                        )
+                    ],
+                    products: [MockProduct(name: "ParentAProduct", modules: ["ParentATarget"])],
+                    dependencies: [
+                        .sourceControl(path: "./Shared", requirement: .upToNextMajor(from: "1.0.0"))
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "ParentB",
+                    targets: [
+                        MockTarget(
+                            name: "ParentBTarget",
+                            dependencies: [.product(name: "SharedProduct", package: "Shared")]
+                        )
+                    ],
+                    products: [MockProduct(name: "ParentBProduct", modules: ["ParentBTarget"])],
+                    dependencies: [
+                        .sourceControl(
+                            path: "./Shared",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: ["TraitB"]
+                        )
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Shared",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [
+                                .product(
+                                    name: "GuardedDefaultProduct",
+                                    package: "GuardedDefault",
+                                    condition: .init(traits: ["TraitDefault"])
+                                ),
+                                .product(
+                                    name: "GuardedCProduct",
+                                    package: "GuardedC",
+                                    condition: .init(traits: ["TraitC"])
+                                ),
+                            ]
+                        )
+                    ],
+                    products: [MockProduct(name: "SharedProduct", modules: ["SharedTarget"])],
+                    dependencies: [
+                        .sourceControl(path: "./GuardedDefault", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./GuardedC", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["TraitDefault"]),
+                        "TraitDefault",
+                        .init(name: "TraitB", enabledTraits: ["TraitC"]),
+                        "TraitC",
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "GuardedDefault",
+                    targets: [MockTarget(name: "GuardedDefaultTarget")],
+                    products: [MockProduct(name: "GuardedDefaultProduct", modules: ["GuardedDefaultTarget"])],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "GuardedC",
+                    targets: [MockTarget(name: "GuardedCTarget")],
+                    products: [MockProduct(name: "GuardedCProduct", modules: ["GuardedCTarget"])],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(
+                    packages: "Root", "ParentA", "ParentB", "Shared", "GuardedDefault", "GuardedC"
+                )
+                result.checkPackage("Shared") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on Shared package.")
+                        return
+                    }
+
+                    XCTAssertEqual(enabledTraits.sorted(), ["TraitB", "TraitC", "TraitDefault"])
+                }
+            }
+            XCTAssertNoDiagnostics(diagnostics)
+        }
+    }
+
+    func testDependencyTraitEnabledViaMultipleRoots() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "RemoteProduct", package: "RemoteWithTraits"),
+                                .product(name: "SecondRootProduct", package: "SecondRoot")
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "../SecondRoot"),
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: ["NotDefaultTrait"]),
+                    ],
+                ),
+                MockPackage(
+                    name: "SecondRoot",
+                    targets: [
+                        MockTarget(
+                            name: "SecondRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "SecondRootProduct",
+                            modules: ["SecondRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"))
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "RemoteWithTraits",
+                    targets: [
+                        MockTarget(
+                            name: "RemoteTarget"
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "RemoteProduct",
+                            modules: ["RemoteTarget"]
+                        )
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                        "NotDefaultTrait"
+                    ],
+                    versions: ["1.0.0", "1.0.1", "2.0.0", "3.0.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root", "SecondRoot"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                XCTAssertNoDiagnostics(diagnostics)
+                result.checkPackage("RemoteWithTraits") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on RemoteWithTraits package.")
+                        return
+                    }
+
+                    XCTAssertTrue(enabledTraits == ["EnabledByDefault", "NotDefaultTrait"])
+                }
+            }
+        }
+    }
+
+    func testDependencyDefaultTraitsExplicitlyEnabled() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "RemoteProduct", package: "RemoteWithTraits"),
+                                .product(name: "SecondRootProduct", package: "SecondRoot")
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "../SecondRoot"),
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: ["default", "NotDefaultTrait"]),
+                    ],
+                ),
+                MockPackage(
+                    name: "SecondRoot",
+                    targets: [
+                        MockTarget(
+                            name: "SecondRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "SecondRootProduct",
+                            modules: ["SecondRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"))
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "RemoteWithTraits",
+                    targets: [
+                        MockTarget(
+                            name: "RemoteTarget",
+                            dependencies: [
+                                .product(name: "Yaml", package: "Yams", condition: .init(traits: ["NotDefaultTrait"]))
+                            ]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "RemoteProduct",
+                            modules: ["RemoteTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./Yams", requirement: .range("1.0.0"..<"2.0.0"))
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                        "NotDefaultTrait"
+                    ],
+                    versions: ["1.0.0", "1.0.1", "2.0.0", "3.0.0"]
+                ),
+                MockPackage(
+                    name: "Yams",
+                    targets: [
+                        MockTarget(
+                            name: "YamlTarget",
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "Yaml",
+                            modules: ["YamlTarget"]
+                        )
+                    ],
+                    versions: ["1.0.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root", "SecondRoot"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                XCTAssertNoDiagnostics(diagnostics)
+                result.checkPackage("RemoteWithTraits") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on RemoteWithTraits package.")
+                        return
+                    }
+
+                    XCTAssertTrue(enabledTraits == ["EnabledByDefault", "NotDefaultTrait"])
+                }
+            }
+        }
+    }
+
+    /// Verifies that when one parent explicitly disables a dependency's default traits (`traits: []`)
+    /// and another parent depends on the same package without specifying traits at all (an implicit
+    /// request for defaults), the two coexist rather than the disabler winning outright: the
+    /// default-setter's request is honored and the dependency's default traits are enabled.
+    func testDependencyDisabledTraitsCoexistWithImplicitDefaultsAcrossRoots() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "RemoteProduct", package: "RemoteWithTraits"),
+                                .product(name: "SecondRootProduct", package: "SecondRoot")
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "../SecondRoot"),
+                        // Root explicitly disables RemoteWithTraits' default traits.
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: []),
+                    ],
+                ),
+                MockPackage(
+                    name: "SecondRoot",
+                    targets: [
+                        MockTarget(
+                            name: "SecondRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "SecondRootProduct",
+                            modules: ["SecondRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        // SecondRoot doesn't specify traits - implicit request for defaults.
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"))
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "RemoteWithTraits",
+                    targets: [
+                        MockTarget(
+                            name: "RemoteTarget"
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "RemoteProduct",
+                            modules: ["RemoteTarget"]
+                        )
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                        "NotDefaultTrait"
+                    ],
+                    versions: ["1.0.0", "1.0.1", "2.0.0", "3.0.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root", "SecondRoot"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                XCTAssertNoDiagnostics(diagnostics)
+                result.checkPackage("RemoteWithTraits") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on RemoteWithTraits package.")
+                        return
+                    }
+
+                    // SecondRoot's implicit default request is honored despite Root's disabler.
+                    XCTAssertTrue(enabledTraits == ["EnabledByDefault"])
+                }
+            }
+        }
+    }
+
+    /// Verifies that when one parent explicitly disables a dependency's default traits (`traits: []`)
+    /// and another parent explicitly enables a specific non-default trait for the same dependency
+    /// (`traits: ["NotDefaultTrait"]`, without naming `default`), the explicit named selection wins
+    /// outright over the disabler - the dependency ends up with just that named trait, not `[]`.
+    func testDependencyExplicitTraitsWinOverDisablerAcrossRoots() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "RemoteProduct", package: "RemoteWithTraits"),
+                                .product(name: "SecondRootProduct", package: "SecondRoot")
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "../SecondRoot"),
+                        // Root explicitly disables RemoteWithTraits' default traits.
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: []),
+                    ],
+                ),
+                MockPackage(
+                    name: "SecondRoot",
+                    targets: [
+                        MockTarget(
+                            name: "SecondRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "SecondRootProduct",
+                            modules: ["SecondRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        // SecondRoot explicitly enables a non-default trait, without naming "default".
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: ["NotDefaultTrait"])
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "RemoteWithTraits",
+                    targets: [
+                        MockTarget(
+                            name: "RemoteTarget"
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "RemoteProduct",
+                            modules: ["RemoteTarget"]
+                        )
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                        "NotDefaultTrait"
+                    ],
+                    versions: ["1.0.0", "1.0.1", "2.0.0", "3.0.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root", "SecondRoot"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                XCTAssertNoDiagnostics(diagnostics)
+                result.checkPackage("RemoteWithTraits") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on RemoteWithTraits package.")
+                        return
+                    }
+
+                    // SecondRoot's explicit named trait wins outright over Root's disabler;
+                    // "EnabledByDefault" is absent since nobody requested defaults.
+                    XCTAssertTrue(enabledTraits == ["NotDefaultTrait"])
+                }
+            }
+        }
+    }
+
+    /// Extends the previous test with a third parent: one parent disables a dependency's default
+    /// traits (`traits: []`), another explicitly enables a non-default trait (`traits:
+    /// ["NotDefaultTrait"]`), and a third depends on the same package without specifying traits at
+    /// all (an implicit request for defaults). The explicit named trait still wins outright over the
+    /// disabler, and the implicit default request unions in on top of it - all three signals combine
+    /// to enable both `NotDefaultTrait` and the dependency's default traits.
+    func testDependencyExplicitTraitsCoexistWithDisablerAndImplicitDefaultsAcrossRoots() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "RemoteProduct", package: "RemoteWithTraits"),
+                                .product(name: "SecondRootProduct", package: "SecondRoot"),
+                                .product(name: "ThirdRootProduct", package: "ThirdRoot")
+                            ]
+                        )
+                    ],
+                    dependencies: [
+                        .fileSystem(path: "../SecondRoot"),
+                        .fileSystem(path: "../ThirdRoot"),
+                        // Root explicitly disables RemoteWithTraits' default traits.
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: []),
+                    ],
+                ),
+                MockPackage(
+                    name: "SecondRoot",
+                    targets: [
+                        MockTarget(
+                            name: "SecondRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "SecondRootProduct",
+                            modules: ["SecondRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        // SecondRoot explicitly enables a non-default trait, without naming "default".
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"), traits: ["NotDefaultTrait"])
+                    ]
+                ),
+                MockPackage(
+                    name: "ThirdRoot",
+                    targets: [
+                        MockTarget(
+                            name: "ThirdRootTarget",
+                            dependencies: [.product(name: "RemoteProduct", package: "RemoteWithTraits")]
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "ThirdRootProduct",
+                            modules: ["ThirdRootTarget"]
+                        )
+                    ],
+                    dependencies: [
+                        // ThirdRoot doesn't specify traits - implicit request for defaults.
+                        .sourceControl(path: "./RemoteWithTraits", requirement: .range("1.0.0"..<"3.0.0"))
+                    ]
+                )
+            ],
+            packages: [
+                MockPackage(
+                    name: "RemoteWithTraits",
+                    targets: [
+                        MockTarget(
+                            name: "RemoteTarget"
+                        )
+                    ],
+                    products: [
+                        MockProduct(
+                            name: "RemoteProduct",
+                            modules: ["RemoteTarget"]
+                        )
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["EnabledByDefault"]),
+                        "EnabledByDefault",
+                        "NotDefaultTrait"
+                    ],
+                    versions: ["1.0.0", "1.0.1", "2.0.0", "3.0.0"]
+                )
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root", "SecondRoot", "ThirdRoot"]) { graph, diagnostics in
+            PackageGraphTesterXCTest(graph) { result in
+                XCTAssertNoDiagnostics(diagnostics)
+                result.checkPackage("RemoteWithTraits") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No enabled traits on RemoteWithTraits package.")
+                        return
+                    }
+
+                    // SecondRoot's explicit named trait wins outright over Root's disabler, and
+                    // ThirdRoot's implicit default request unions "EnabledByDefault" on top of it.
+                    XCTAssertTrue(enabledTraits == ["NotDefaultTrait", "EnabledByDefault"])
+                }
+            }
+        }
+    }
+
+    /// Reproduces a scenario where two root packages both depend on the same intermediary package
+    /// (`Configuration`): the package being built (`Dependent`) explicitly enables `["default", "YAMLSupport"]`
+    /// on it, while a sibling root (`Dependency`) declares it with no `traits:` at all (implicit defaults).
+    /// `Configuration`'s own dependency on `Yams` is guarded by the `YAMLSupport` trait and has no
+    /// `traits:` parameter of its own - `Yams` must still be resolved and fetched.
+    func testTraitGuardedTransitiveDependency_MultipleRootsWithImplicitDefaults() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Dependent",
+                    targets: [
+                        MockTarget(
+                            name: "DependentTarget",
+                            dependencies: [
+                                .product(name: "Configuration", package: "Configuration"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "DependentProduct", modules: ["DependentTarget"]),
+                    ],
+                    dependencies: [
+                        .sourceControl(
+                            path: "./Configuration",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: ["default", "YAMLSupport"]
+                        ),
+                    ]
+                ),
+                MockPackage(
+                    name: "Dependency",
+                    targets: [
+                        MockTarget(
+                            name: "DependencyTarget",
+                            dependencies: [
+                                .product(name: "Configuration", package: "Configuration"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "DependencyProduct", modules: ["DependencyTarget"]),
+                    ],
+                    dependencies: [
+                        // No `traits:` specified - implicit defaults for Configuration.
+                        .sourceControl(path: "./Configuration", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                ),
+            ],
+            packages: [
+                MockPackage(
+                    name: "Configuration",
+                    targets: [
+                        MockTarget(
+                            name: "ConfigurationTarget",
+                            dependencies: [
+                                .product(
+                                    name: "Yams",
+                                    package: "Yams",
+                                    condition: .init(traits: ["YAMLSupport"])
+                                ),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "Configuration", modules: ["ConfigurationTarget"]),
+                    ],
+                    dependencies: [
+                        // Deliberately no `traits:` here - mirrors swift-configuration's real
+                        // dependency on Yams, which has no explicit trait selection.
+                        .sourceControl(path: "./Yams", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["DefaultTrait"]),
+                        "DefaultTrait",
+                        "YAMLSupport",
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "Yams",
+                    targets: [
+                        MockTarget(name: "YamsTarget"),
+                    ],
+                    products: [
+                        MockProduct(name: "Yams", modules: ["YamsTarget"]),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Dependent", "Dependency"]) { graph, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(roots: "Dependent", "Dependency")
+                result.check(packages: "Dependent", "Dependency", "Configuration", "Yams")
+                result.check(modules: "DependentTarget", "DependencyTarget", "ConfigurationTarget", "YamsTarget")
+                result.checkPackage("Configuration") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("Expected DefaultTrait, YAMLSupport traits to be enabled on package Configuration.")
+                        return
+                    }
+
+                    XCTAssertEqual(enabledTraits, ["DefaultTrait", "YAMLSupport"])
+                }
+            }
+        }
+        await workspace.checkManagedDependencies { result in
+            result.check(dependency: "configuration", at: .checkout(.version("1.0.0")))
+            result.check(dependency: "yams", at: .checkout(.version("1.0.0")))
+        }
+    }
+
+    /// Two siblings depend on the same shared package with different trait requests, decided at
+    /// different points during resolution rather than both being known upfront - unlike the
+    /// root-level case, nothing guarantees every parent's request is known before the shared
+    /// dependency itself is decided.
+    func testTraitGuardedTransitiveDependency_enabledTraitsAtDifferentLevels() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "SiblingAProduct", package: "SiblingA"),
+                                .product(name: "SiblingBProduct", package: "SiblingB"),
+                            ]
+                        ),
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./SiblingA", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./SiblingB", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                ),
+            ],
+            packages: [
+                MockPackage(
+                    name: "SiblingA",
+                    targets: [
+                        MockTarget(
+                            name: "SiblingATarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "SharedDependency"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SiblingAProduct", modules: ["SiblingATarget"]),
+                    ],
+                    dependencies: [
+                        // No `traits:` specified - implicit defaults for SharedDependency.
+                        .sourceControl(path: "./SharedDependency", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "SiblingB",
+                    targets: [
+                        MockTarget(
+                            name: "SiblingBTarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "SharedDependency"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SiblingBProduct", modules: ["SiblingBTarget"]),
+                    ],
+                    dependencies: [
+                        .sourceControl(
+                            path: "./SharedDependency",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: ["default", "FeatureX"]
+                        ),
+                    ],
+                    versions: ["1.0.0", "1.2.0"]
+                ),
+                MockPackage(
+                    name: "SharedDependency",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [
+                                .product(
+                                    name: "GuardedProduct",
+                                    package: "GuardedLeaf",
+                                    condition: .init(traits: ["FeatureX"])
+                                ),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SharedProduct", modules: ["SharedTarget"]),
+                    ],
+                    dependencies: [
+                        // Deliberately no `traits:` here
+                        .sourceControl(path: "./GuardedLeaf", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["DefaultTrait"]),
+                        "DefaultTrait",
+                        "FeatureX",
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "GuardedLeaf",
+                    targets: [
+                        MockTarget(name: "GuardedLeafTarget"),
+                    ],
+                    products: [
+                        MockProduct(name: "GuardedProduct", modules: ["GuardedLeafTarget"]),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(roots: "Root")
+                result.check(packages: "Root", "SiblingA", "SiblingB", "SharedDependency", "GuardedLeaf")
+                result.check(modules: "RootTarget", "SiblingATarget", "SiblingBTarget", "SharedTarget", "GuardedLeafTarget")
+                result.checkPackage("SharedDependency") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("Expected enabled traits for package SharedDependency.")
+                        return
+                    }
+
+                    XCTAssertEqual(enabledTraits, ["DefaultTrait", "FeatureX"])
+                }
+            }
+        }
+        await workspace.checkManagedDependencies { result in
+            result.check(dependency: "shareddependency", at: .checkout(.version("1.0.0")))
+            result.check(dependency: "guardedleaf", at: .checkout(.version("1.0.0")))
+        }
+    }
+
+    /// Same shape as the test above, but the guarding trait is never requested directly.
+    /// `SiblingB` only asks for `FeatureX`, and `SharedDependency`'s own trait declarations
+    /// should recursively unfurl into the trait that actually guards `GuardedLeaf`.
+    func testTraitGuardedTransitiveDependency_TransitivelyEnabledTraits_enabledTraitsAtDifferentLevels() async throws {
+        let sandbox = AbsolutePath("/tmp/ws/")
+        let fs = InMemoryFileSystem()
+
+        let workspace = try await MockWorkspace(
+            sandbox: sandbox,
+            fileSystem: fs,
+            roots: [
+                MockPackage(
+                    name: "Root",
+                    targets: [
+                        MockTarget(
+                            name: "RootTarget",
+                            dependencies: [
+                                .product(name: "SiblingAProduct", package: "SiblingA"),
+                                .product(name: "SiblingBProduct", package: "SiblingB"),
+                            ]
+                        ),
+                    ],
+                    dependencies: [
+                        .sourceControl(path: "./SiblingA", requirement: .upToNextMajor(from: "1.0.0")),
+                        .sourceControl(path: "./SiblingB", requirement: .upToNextMajor(from: "1.0.0")),
+                    ]
+                ),
+            ],
+            packages: [
+                MockPackage(
+                    name: "SiblingA",
+                    targets: [
+                        MockTarget(
+                            name: "SiblingATarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "SharedDependency"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SiblingAProduct", modules: ["SiblingATarget"]),
+                    ],
+                    dependencies: [
+                        // No `traits:` specified - implicit defaults for SharedDependency.
+                        .sourceControl(path: "./SharedDependency", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "SiblingB",
+                    targets: [
+                        MockTarget(
+                            name: "SiblingBTarget",
+                            dependencies: [
+                                .product(name: "SharedProduct", package: "SharedDependency"),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SiblingBProduct", modules: ["SiblingBTarget"]),
+                    ],
+                    dependencies: [
+                        // Only ever requests defaults and `FeatureX` directly
+                        .sourceControl(
+                            path: "./SharedDependency",
+                            requirement: .upToNextMajor(from: "1.0.0"),
+                            traits: ["default", "FeatureX"]
+                        ),
+                    ],
+                    versions: ["1.0.0", "1.2.0"]
+                ),
+                MockPackage(
+                    name: "SharedDependency",
+                    targets: [
+                        MockTarget(
+                            name: "SharedTarget",
+                            dependencies: [
+                                // Guarded by `FeatureXImpl`, not `FeatureX` - only reachable via
+                                // `FeatureX`'s recursive `enabledTraits` unfurling below.
+                                .product(
+                                    name: "GuardedProduct",
+                                    package: "GuardedLeaf",
+                                    condition: .init(traits: ["FeatureXImpl"])
+                                ),
+                            ]
+                        ),
+                    ],
+                    products: [
+                        MockProduct(name: "SharedProduct", modules: ["SharedTarget"]),
+                    ],
+                    dependencies: [
+                        // Deliberately no `traits:` here
+                        .sourceControl(path: "./GuardedLeaf", requirement: .upToNextMajor(from: "1.0.0")),
+                    ],
+                    traits: [
+                        .init(name: "default", enabledTraits: ["Surprise"]),
+                        // `FeatureX` recursively enables `FeatureXImpl` - `SiblingB` never asks
+                        // for `FeatureXImpl` by name.
+                        "Surprise",
+                        .init(name: "FeatureX", enabledTraits: ["FeatureXImpl"]),
+                        .init(name: "FeatureXImpl", enabledTraits: ["LastTrait"]),
+                        "LastTrait"
+                    ],
+                    versions: ["1.0.0"]
+                ),
+                MockPackage(
+                    name: "GuardedLeaf",
+                    targets: [
+                        MockTarget(name: "GuardedLeafTarget"),
+                    ],
+                    products: [
+                        MockProduct(name: "GuardedProduct", modules: ["GuardedLeafTarget"]),
+                    ],
+                    versions: ["1.0.0"]
+                ),
+            ]
+        )
+
+        try await workspace.checkPackageGraph(roots: ["Root"]) { graph, diagnostics in
+            XCTAssertNoDiagnostics(diagnostics)
+            PackageGraphTesterXCTest(graph) { result in
+                result.check(roots: "Root")
+                result.check(packages: "Root", "SiblingA", "SiblingB", "SharedDependency", "GuardedLeaf")
+                result.check(modules: "RootTarget", "SiblingATarget", "SiblingBTarget", "SharedTarget", "GuardedLeafTarget")
+                result.checkPackage("SharedDependency") { package in
+                    guard let enabledTraits = package.enabledTraits else {
+                        XCTFail("No traits enabled on SharedDependency -- expected to find FeatureX, FeatureXImpl, and LastTrait.")
+                        return
+                    }
+
+                    XCTAssertEqual(enabledTraits, ["FeatureX", "FeatureXImpl", "LastTrait", "Surprise"])
+                }
+            }
+        }
+        await workspace.checkManagedDependencies { result in
+            result.check(dependency: "shareddependency", at: .checkout(.version("1.0.0")))
+            result.check(dependency: "guardedleaf", at: .checkout(.version("1.0.0")))
+        }
+    }
+}
